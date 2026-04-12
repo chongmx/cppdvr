@@ -31,6 +31,8 @@ add_library(cppdvr SHARED
     src/dllmain.cpp
     src/dvrip.cpp
     src/stream_server.cpp
+    src/udp_stream_server.cpp
+    src/video_recorder.cpp
 )
 
 target_include_directories(cppdvr
@@ -70,5 +72,14 @@ if(CPPDVR_BUILD_DEMO)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:cppdvr>
             $<TARGET_FILE_DIR:cppdvr_demo>
+    )
+
+    add_executable(cppdvr_test_frame demo/test_frame.cpp)
+    target_link_libraries(cppdvr_test_frame PRIVATE cppdvr)
+    target_include_directories(cppdvr_test_frame PRIVATE include)
+    add_custom_command(TARGET cppdvr_test_frame POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:cppdvr>
+            $<TARGET_FILE_DIR:cppdvr_test_frame>
     )
 endif()

@@ -1,49 +1,74 @@
 /**
- * demo/main.cpp — DVR connection + frame-reception diagnostic tool
+ * demo/main.cpp — DVR → ffmpeg → JPEG → UDP stream diagnostic tool
  *
  * Build:  cmake --build . --config Release --target cppdvr_demo
- * Run:    x64\Release\cppdvr_demo.exe  [host]  [user]  [password]
+ * Run:    x64\Release\cppdvr_demo.exe  [dvr_host]  [user]  [password]  [stream]  [--run]
  *
- * Connects directly to the DVR camera using the DVRIPCam C++ class
- * (bypasses StreamServer entirely) and prints every received frame
- * with its type, size, and first bytes.  Useful for verifying that
- * the DVRIP → frame pipeline works before involving ffmpeg/HTTP.
+ * Pipeline:
+ *   DVRIPCam (DVRIP)
+ *     └─► StreamServer (ffmpeg decodes H264/H265 → real JPEG)
+ *              ├─► HTTP  http://localhost:8080/stream   (browser debug view)
+ *              └─► UdpStreamServer → Quest 3 headset    (live UDP JPEG stream)
+ *                        └─► receives Quest 3 controller input
+ *
+ * Root cause of "no image on Quest":
+ *   The previous version sent raw H264/H265 NAL bytes as UDP "JPEG" chunks.
+ *   The Quest JPEG decoder rejected them.  This version wires StreamServer's
+ *   ffmpeg output (real JPEG bytes starting with FF D8) directly into
+ *   UdpStreamServer::sendJpeg().
+ *
+ * Modes:
+ *   default  — diagnostic run for 30 s, then print summary and exit.
+ *   --run    — stream indefinitely; status line every 5 s.
+ *              Type  q <Enter>  to stop cleanly.
+ *
+ * Hard-coded network config (edit constants below):
+ *   LOCAL_IP  — NIC to bind the UDP socket ("0.0.0.0" = all interfaces)
+ *   TARGET_IP — Quest 3 IP  ("" = auto-detect from first inbound packet)
+ *   RX_PORT   — port this PC listens on (headset sends here)
+ *   TX_PORT   — port the headset listens on (we send here)
+ *   HTTP_PORT — local MJPEG server for browser debug view
  *
  * Expected healthy output:
- *   [  0 ms] LOGIN OK   session=0x00001234  alive=20s
- *   [  8 ms] CLAIM OK   Ret=100
- *   [  9 ms] START sent
- *   [189 ms] FRAME #1   type=h264  frame=I  500x300@25fps  size=45678
- *              bytes: 00 00 00 01 67 ...
- *   [222 ms] FRAME #2   type=h264  frame=P  size=1234
- *   ...
+ *   [    0 ms] StreamServer starting...
+ *   [  133 ms] DVR: login OK  session=0x00001234  stream=Main
+ *   [  214 ms] ffmpeg: codec=h265  832x1616 @ 25 fps
+ *   [  350 ms] ffmpeg: first JPEG frame ready — streaming
+ *   [  351 ms] JPEG #1    size=18432 B  KB_total=18  target=(waiting for Quest)
+ *   [  500 ms] INPUT #1   seq=42  RIGHT active=1  trig=0.00  grip=0.00
  */
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <windows.h>    // timeGetTime
+#include <windows.h>
 
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdio>
-#include <iomanip>
-#include <iostream>
-#include <map>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
 
-#include "dvrip.h"
+#include "stream_server.h"
+#include "udp_stream_server.h"
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// ── Hard-coded network config ──────────────────────────────────────────────────
+static constexpr const char* LOCAL_IP  = "0.0.0.0";  // bind all NICs for UDP RX
+static constexpr const char* TARGET_IP = "";          // "" = auto-discover Quest IP
+static constexpr int         RX_PORT   = 9000;        // we listen here
+static constexpr int         TX_PORT   = 9001;        // Quest listens here
+static constexpr int         HTTP_PORT = 8080;        // browser debug: /stream
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 static auto g_t0 = std::chrono::steady_clock::now();
 
 static long long ms_now() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now() - g_t0)
-        .count();
+               std::chrono::steady_clock::now() - g_t0).count();
 }
 
 static std::mutex g_print_mtx;
@@ -57,126 +82,218 @@ static void print(const char* fmt, Args... args) {
     std::fflush(stdout);
 }
 
-static void hex8(const uint8_t* d, size_t n) {
-    std::printf("              bytes:");
-    for (size_t i = 0; i < n && i < 16; ++i)
-        std::printf(" %02x", d[i]);
-    if (n > 16) std::printf(" ...");
-    std::printf("\n");
-    std::fflush(stdout);
-}
-
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
-    const char* host     = (argc > 1) ? argv[1] : "172.20.80.12";
-    const char* user     = (argc > 2) ? argv[2] : "admin";
-    const char* password = (argc > 3) ? argv[3] : "";
-    const char* stream   = (argc > 4) ? argv[4] : "Main";
+    // ── Parse arguments ───────────────────────────────────────────────────────
+    // cppdvr_demo.exe  [host]  [user]  [password]  [stream]  [--run]
+    // --run may appear at any position.
+    bool        run_forever = false;
+    const char* host        = "172.20.80.12";
+    const char* user        = "admin";
+    const char* password    = "";
+    const char* stream      = "Main";
 
-    std::printf("=== cppdvr diagnostic ===\n");
-    std::printf("host=%s  user=%s  stream=%s\n\n", host, user, stream);
+    int positional = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--run") == 0) {
+            run_forever = true;
+        } else {
+            switch (positional++) {
+                case 0: host     = argv[i]; break;
+                case 1: user     = argv[i]; break;
+                case 2: password = argv[i]; break;
+                case 3: stream   = argv[i]; break;
+            }
+        }
+    }
+
+    std::printf("=== cppdvr demo ===\n");
+    std::printf("DVR   host=%s  user=%s  stream=%s\n", host, user, stream);
+    std::printf("UDP   local=%s  target=%s  rx=%d  tx=%d\n",
+                LOCAL_IP, *TARGET_IP ? TARGET_IP : "(auto)", RX_PORT, TX_PORT);
+    std::printf("HTTP  http://localhost:%d/stream  (browser debug)\n", HTTP_PORT);
+    if (run_forever)
+        std::printf("Mode: CONTINUOUS — type  q <Enter>  to quit\n");
+    else
+        std::printf("Mode: DIAGNOSTIC — 30 s timed run  (add --run for continuous)\n");
+    std::printf("\n");
     std::fflush(stdout);
 
-    // ── 1. Create camera ──────────────────────────────────────────────────────
-    cppdvr::DVRIPCam cam(host, user, password);
+    // ── 1. UDP stream server ──────────────────────────────────────────────────
+    cppdvr::UdpStreamServer udp;
+    udp.setLocalIP(LOCAL_IP);
+    udp.setTargetIP(TARGET_IP);
+    udp.setRXPort(RX_PORT);
+    udp.setTXPort(TX_PORT);
+    udp.setLocalhostDebug(false);
 
-    // Forward DVR-internal log messages (Claim/Start/first-frame)
-    cam.set_log_callback([](const char* msg) {
-        print("DVR-LOG: %s", msg);
+    udp.setLogCallback([](const char* msg) {
+        print("%s", msg);
     });
 
-    // ── 2. Login ──────────────────────────────────────────────────────────────
-    print("Attempting login ...");
-    if (!cam.login()) {
-        print("LOGIN FAILED: %s", cam.last_error().c_str());
-        return 1;
-    }
-    print("LOGIN OK   session=0x%08X", cam.session_id());
+    // Controller input — print Quest 3 state
+    std::atomic<int> input_count{0};
+    udp.setOnInputCallback([&](const cppdvr::UdpInputEvent& e) {
+        int n = ++input_count;
+        // Full detail for first 5, then every 50th
+        if (n > 5 && n % 50 != 0) return;
 
-    // ── 3. Start monitor and collect frames ───────────────────────────────────
-    std::atomic<int> total_frames{0};
-    std::map<std::string, int> type_counts;
-    std::map<std::string, int> frame_counts;
-    std::mutex counts_mtx;
-    bool first_iframe_seen = false;
-
-    auto frame_cb = [&](const uint8_t*             data,
-                         size_t                     size,
-                         const cppdvr::FrameMeta&   meta)
-    {
-        int n = ++total_frames;
-
-        {
-            std::lock_guard<std::mutex> lk(counts_mtx);
-            type_counts[meta.type.empty() ? "(empty)" : meta.type]++;
-            frame_counts[meta.frame.empty() ? "(empty)" : meta.frame]++;
-        }
-
-        // Print first 30 frames in full detail, then every 100th
-        bool print_detail = (n <= 30) || (n % 100 == 0);
-
-        if (print_detail) {
-            std::lock_guard<std::mutex> lk(g_print_mtx);
-            std::printf("[%6lld ms] FRAME #%-4d  type=%-8s  frame=%s"
-                        "  %dx%d@%dfps  size=%zu\n",
-                ms_now(), n,
-                meta.type.empty()  ? "(empty)" : meta.type.c_str(),
-                meta.frame.empty() ? "(empty)" : meta.frame.c_str(),
-                meta.width, meta.height, meta.fps,
-                size);
-            if (size > 0) hex8(data, size);
-            std::fflush(stdout);
-        }
-
-        if (!first_iframe_seen && meta.frame == "I") {
-            first_iframe_seen = true;
-            print("*** FIRST I-FRAME at %lld ms  type=%s  size=%zu ***",
-                  ms_now(), meta.type.c_str(), size);
-        }
-    };
-
-    print("Starting monitor (stream=%s) ...", stream);
-    if (!cam.start_monitor(frame_cb, stream)) {
-        print("start_monitor FAILED: %s", cam.last_error().c_str());
-        return 1;
-    }
-    print("Monitor thread launched — waiting up to 30 s for frames ...");
-
-    // ── 4. Status ticker ──────────────────────────────────────────────────────
-    for (int sec = 1; sec <= 30; ++sec) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-
+        const auto& L = e.left;
+        const auto& R = e.right;
         std::lock_guard<std::mutex> lk(g_print_mtx);
-        std::printf("[%6lld ms] -- tick %2d s --  total_frames=%d",
-                    ms_now(), sec, total_frames.load());
-        {
-            std::lock_guard<std::mutex> lk2(counts_mtx);
-            for (auto& [k, v] : type_counts)
-                std::printf("  %s=%d", k.c_str(), v);
-        }
-        std::printf("\n");
+        std::printf("[%6lld ms] INPUT #%-4d  seq=%u\n", ms_now(), n, e.seq);
+        std::printf("  LEFT   A=%d B=%d menu=%d  "
+                    "trig=%.2f(%d) grip=%.2f(%d)  "
+                    "stick=(%.2f,%.2f)  active=%d\n",
+                    L.primary_button, L.secondary_button, L.menu_button,
+                    L.trigger_value,  L.trigger_click,
+                    L.grip_value,     L.grip_click,
+                    L.thumbstick_x,   L.thumbstick_y, L.active);
+        std::printf("  RIGHT  A=%d B=%d menu=%d  "
+                    "trig=%.2f(%d) grip=%.2f(%d)  "
+                    "stick=(%.2f,%.2f)  active=%d\n",
+                    R.primary_button, R.secondary_button, R.menu_button,
+                    R.trigger_value,  R.trigger_click,
+                    R.grip_value,     R.grip_click,
+                    R.thumbstick_x,   R.thumbstick_y, R.active);
+        std::printf("  GUI    [%d %d %d %d %d %d %d %d]\n",
+                    e.gui[0], e.gui[1], e.gui[2], e.gui[3],
+                    e.gui[4], e.gui[5], e.gui[6], e.gui[7]);
+        std::fflush(stdout);
+    });
+
+    // Inbound JPEG from Quest (its own camera view, optional)
+    udp.setOnJpegCallback([](uint32_t fid, const uint8_t* /*data*/, size_t size) {
+        print("UDP RX: Quest JPEG  frame_id=%u  size=%zu", fid, size);
+    });
+
+    if (!udp.init()) {
+        print("UDP init FAILED — port %d in use?", RX_PORT);
+        return 1;
+    }
+    if (!udp.start()) {
+        print("UDP start FAILED");
+        udp.deinit();
+        return 1;
+    }
+
+    // ── 2. Stream server: DVR → ffmpeg → real JPEG ────────────────────────────
+    cppdvr::StreamServerConfig cfg;
+    cfg.dvr_host     = host;
+    cfg.dvr_user     = user;
+    cfg.dvr_password = password;
+    cfg.stream_type  = stream;
+    cfg.http_port    = HTTP_PORT;
+    cfg.jpeg_quality = 1;   // ffmpeg -q:v  (1=best/largest … 31=smallest)
+
+    cppdvr::StreamServer srv(cfg);
+
+    srv.set_log_callback([](const char* msg) {
+        print("%s", msg);
+    });
+
+    // ── JPEG-ready callback ────────────────────────────────────────────────────
+    // Fired by the ffmpeg pipeline thread for every decoded JPEG.
+    // This is the only correct place to get real JPEG bytes — NOT from the
+    // DVRIPCam frame callback which delivers raw H264/H265 NAL data.
+    std::atomic<int>    jpeg_count{0};
+    std::atomic<size_t> jpeg_bytes_total{0};
+
+    srv.set_jpeg_callback([&](const uint8_t* data, size_t size) {
+        int n = ++jpeg_count;
+        jpeg_bytes_total += size;
+
+        // Log first 5, then every 100th
+        if (n <= 5 || n % 100 == 0)
+            print("JPEG #%-4d  size=%zu B  KB_total=%zu  target=%s",
+                  n, size, jpeg_bytes_total.load() / 1024,
+                  udp.targetIP().empty() ? "(waiting for Quest)" : udp.targetIP().c_str());
+
+        // Send the real JPEG to the Quest headset over UDP
+        udp.sendJpeg(data, size, static_cast<uint32_t>(n));
+    });
+
+    print("StreamServer starting...");
+    if (!srv.start()) {
+        print("StreamServer start FAILED");
+        udp.stop();
+        udp.deinit();
+        return 1;
+    }
+    print("HTTP debug stream: http://localhost:%d/stream", HTTP_PORT);
+
+    // ── 3. Keyboard thread (--run mode only) ──────────────────────────────────
+    std::atomic<bool> quit_flag{false};
+    std::thread kbd_thread;
+
+    if (run_forever) {
+        std::printf("--- streaming indefinitely ---  type  q <Enter>  to quit\n");
         std::fflush(stdout);
 
-        if (total_frames.load() > 200) break;  // got plenty, stop early
+        kbd_thread = std::thread([&quit_flag]() {
+            char line[64];
+            while (std::fgets(line, sizeof(line), stdin)) {
+                if (line[0] == 'q' || line[0] == 'Q') {
+                    quit_flag.store(true);
+                    break;
+                }
+            }
+            quit_flag.store(true);  // also fires on EOF / pipe close
+        });
     }
 
-    // ── 5. Stop and report ────────────────────────────────────────────────────
-    print("Stopping monitor ...");
-    cam.stop_monitor();
+    // ── 4. Status ticker ──────────────────────────────────────────────────────
+    // Diagnostic: 1 s ticks, stop at 30 s.
+    // Continuous:  5 s ticks, stop on 'q'.
+    const int tick_sec  = run_forever ? 5  : 1;
+    const int max_ticks = run_forever ? INT_MAX : 30;
+
+    for (int tick = 1; tick <= max_ticks; ++tick) {
+        // Sleep in 200 ms slices to react to quit_flag quickly
+        for (int ms = 0; ms < tick_sec * 1000; ms += 200) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            if (quit_flag.load() || !srv.is_running()) goto done_ticking;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(g_print_mtx);
+            std::printf("[%6lld ms] -- %s %d s --  "
+                        "jpegs=%d  KB_sent=%zu  "
+                        "input_pkts=%d  target=%s\n",
+                        ms_now(),
+                        run_forever ? "uptime" : "tick",
+                        run_forever ? (tick * tick_sec) : tick,
+                        jpeg_count.load(),
+                        jpeg_bytes_total.load() / 1024,
+                        input_count.load(),
+                        udp.targetIP().empty() ? "(none yet)" : udp.targetIP().c_str());
+            std::fflush(stdout);
+        }
+    }
+    done_ticking:;
+
+    // ── 5. Shutdown ───────────────────────────────────────────────────────────
+    if (kbd_thread.joinable()) {
+        quit_flag.store(true);
+        kbd_thread.detach();
+    }
+
+    print("Stopping StreamServer ...");
+    srv.stop();
+
+    print("Stopping UDP server ...");
+    udp.stop();
+    udp.deinit();
 
     std::printf("\n=== RESULT ===\n");
-    std::printf("total_frames : %d\n", total_frames.load());
-    {
-        std::lock_guard<std::mutex> lk(counts_mtx);
-        std::printf("by type:\n");
-        for (auto& [k, v] : type_counts)
-            std::printf("  %-10s : %d\n", k.c_str(), v);
-        std::printf("by frame kind:\n");
-        for (auto& [k, v] : frame_counts)
-            std::printf("  %-10s : %d\n", k.c_str(), v);
-    }
-    std::printf("first I-frame: %s\n", first_iframe_seen ? "YES" : "NO — bug!");
+    std::printf("JPEG frames sent  : %d\n",  jpeg_count.load());
+    std::printf("KB sent over UDP  : %zu\n", jpeg_bytes_total.load() / 1024);
+    std::printf("Quest inputs recv : %d\n",  input_count.load());
+    std::printf("result            : %s\n",
+                jpeg_count.load() > 0
+                    ? "OK — real JPEG frames streamed to Quest"
+                    : "FAIL — no JPEG frames (is ffmpeg in PATH?)");
 
-    return first_iframe_seen ? 0 : 1;
+    return jpeg_count.load() > 0 ? 0 : 1;
 }

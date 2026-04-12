@@ -174,15 +174,28 @@ struct FfmpegProc {
     HANDLE hProcess     {INVALID_HANDLE_VALUE};
     HANDLE hThread_proc {INVALID_HANDLE_VALUE};
 
-    bool start(const std::string& codec, int jpeg_quality) {
+    bool start(const std::string& codec, int jpeg_quality,
+               int jpeg_scale_w = 0, int jpeg_scale_h = 0) {
         // Map DVRIP codec name to ffmpeg format name
         std::string fmt = "h264";
         if (codec == "h265") fmt = "hevc";
         else if (codec == "mpeg4") fmt = "mpeg4";
 
+        // Scale filter: use cfg.scale_width/height to resize before JPEG encode.
+        // -1 on one dimension keeps the aspect ratio (e.g. "scale=416:-1").
+        // Leave both 0 to pass the native camera resolution through unchanged.
+        std::string scale_filter;
+        if (jpeg_scale_w > 0 || jpeg_scale_h > 0) {
+            int w = jpeg_scale_w > 0 ? jpeg_scale_w : -1;
+            int h = jpeg_scale_h > 0 ? jpeg_scale_h : -1;
+            scale_filter = std::string(" -vf scale=") + std::to_string(w)
+                         + ":" + std::to_string(h);
+        }
+
         std::string cmd =
             "ffmpeg -loglevel warning"
             " -f " + fmt + " -i pipe:0"
+            + scale_filter +
             " -f mjpeg -q:v " + std::to_string(jpeg_quality) +
             " pipe:1";
 
@@ -389,6 +402,14 @@ struct StreamServer::Impl {
     std::mutex             log_mutex;
     StreamServer::LogFn    log_fn;
 
+    // ── JPEG-ready callback ───────────────────────────────────────────────────
+    std::mutex               jpeg_cb_mutex;
+    StreamServer::JpegReadyFn jpeg_cb;
+
+    // ── Raw-frame callback (for recording) ────────────────────────────────────
+    std::mutex                raw_frame_cb_mutex;
+    StreamServer::RawFrameFn  raw_frame_cb;
+
     void log(const char* fmt, ...) {
         char buf[512];
         va_list ap;
@@ -444,6 +465,15 @@ struct StreamServer::Impl {
                 [this](const uint8_t* data, size_t size, const FrameMeta& meta) {
                     if (size == 0) return;
                     if (meta.frame.empty() && meta.type.empty()) return;
+
+                    // Fire raw-frame callback for video frames only (skip audio/info).
+                    // Used by VideoRecorder for lossless MP4 recording.
+                    if (!meta.type.empty() &&
+                        meta.type != "g711a" && meta.type != "info") {
+                        std::lock_guard<std::mutex> lk(raw_frame_cb_mutex);
+                        if (raw_frame_cb)
+                            raw_frame_cb(data, size, meta.type, meta.frame == "I");
+                    }
 
                     RawFrame f;
                     f.data.assign(data, data + size);
@@ -507,10 +537,16 @@ struct StreamServer::Impl {
             if (!running.load()) break;
 
             // Start ffmpeg
-            log("ffmpeg: launching  -f %s -i pipe:0 -f mjpeg -q:v %d pipe:1",
-                (codec == "h265" ? "hevc" : codec.c_str()), cfg.jpeg_quality);
+            if (cfg.jpeg_scale_w > 0 || cfg.jpeg_scale_h > 0)
+                log("ffmpeg: launching  codec=%s  q=%d  scale=%dx%d",
+                    codec.c_str(), cfg.jpeg_quality,
+                    cfg.jpeg_scale_w, cfg.jpeg_scale_h);
+            else
+                log("ffmpeg: launching  codec=%s  q=%d  scale=native",
+                    codec.c_str(), cfg.jpeg_quality);
             FfmpegProc ffmpeg;
-            if (!ffmpeg.start(codec, cfg.jpeg_quality)) {
+            if (!ffmpeg.start(codec, cfg.jpeg_quality,
+                              cfg.jpeg_scale_w, cfg.jpeg_scale_h)) {
                 log("ffmpeg: FAILED to start — is 'ffmpeg' in PATH? Retrying in 5 s");
                 std::this_thread::sleep_for(std::chrono::seconds(5));
                 continue;
@@ -561,6 +597,13 @@ struct StreamServer::Impl {
                         // Complete JPEG
                         std::vector<uint8_t> jpeg(d + soi, d + eoi);
                         bool first_frame = latest_jpeg.get().empty();
+
+                        // Fire JPEG-ready callback before moving (move empties the vector)
+                        {
+                            std::lock_guard<std::mutex> lk(jpeg_cb_mutex);
+                            if (jpeg_cb) jpeg_cb(jpeg.data(), jpeg.size());
+                        }
+
                         latest_jpeg.update(std::move(jpeg));
                         if (first_frame) log("ffmpeg: first JPEG frame ready — streaming");
 
@@ -696,6 +739,16 @@ const StreamServerConfig& StreamServer::config() const {
 void StreamServer::set_log_callback(LogFn fn) {
     std::lock_guard<std::mutex> lk(d_->log_mutex);
     d_->log_fn = std::move(fn);
+}
+
+void StreamServer::set_jpeg_callback(JpegReadyFn fn) {
+    std::lock_guard<std::mutex> lk(d_->jpeg_cb_mutex);
+    d_->jpeg_cb = std::move(fn);
+}
+
+void StreamServer::set_raw_frame_callback(RawFrameFn fn) {
+    std::lock_guard<std::mutex> lk(d_->raw_frame_cb_mutex);
+    d_->raw_frame_cb = std::move(fn);
 }
 
 } // namespace cppdvr
