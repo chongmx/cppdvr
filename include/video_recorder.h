@@ -96,6 +96,22 @@ public:
     // Returns false if srv is nullptr.
     bool init(StreamServer* srv);
 
+    // Initialise without a StreamServer (for testing / standalone use).
+    // In this mode the recorder does NOT auto-tap raw frames from a stream —
+    // call feed_raw_frame() manually to inject NAL data for MP4 recording.
+    // Returns true (always succeeds).
+    bool init_standalone();
+
+    // Inject a raw NAL frame directly into the recorder queue (MP4 mode).
+    // Use this when the recorder was initialised with init_standalone() and
+    // you are feeding raw H264/H265 Annex-B bytes yourself.
+    //   codec     : "h264" or "h265" (or "" to auto-detect from NAL bytes)
+    //   is_iframe : hint — the writer also re-checks via NAL scan, so this
+    //               does not need to be precise.
+    void feed_raw_frame(const uint8_t* data, size_t size,
+                        const std::string& codec = "",
+                        bool is_iframe = false);
+
     // Detach from srv and release all resources.
     // Implicitly calls discard_recording() if a recording is in progress.
     void deinit();

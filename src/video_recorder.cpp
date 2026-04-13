@@ -37,22 +37,54 @@
 namespace cppdvr {
 
 // ════════════════════════════════════════════════════════════════════════════════
-// NAL codec detection (mirrors stream_server.cpp — kept local to avoid coupling)
+// NAL codec + I-frame detection
 // ════════════════════════════════════════════════════════════════════════════════
+//
+// Scans the first 1 KB of a raw frame for I-frame NAL units (SPS/PPS/IDR for
+// H264; VPS/SPS/PPS/IRAP for H265).  Returns "h264" or "h265" only when an
+// actual parameter-set or IDR NAL is found — NOT for AUD or P-frame slices.
+//
+// Why scan instead of checking byte 0 only?
+//   Many DVR cameras prepend an Access Unit Delimiter (H264 type 9 / H265 type
+//   35) before the SPS/PPS/IDR NALs on every I-frame.  Checking only the first
+//   NAL byte would see the AUD and return "" even for real I-frames, causing the
+//   recorder to drop every I-frame and never start ffmpeg.
+//
 static std::string rec_detect_codec(const uint8_t* data, size_t len) {
-    if (len < 5) return "";
-    uint8_t nal_byte = 0;
-    if      (data[0]==0 && data[1]==0 && data[2]==0 && data[3]==1) nal_byte = data[4];
-    else if (data[0]==0 && data[1]==0 && data[2]==1)                nal_byte = data[3];
-    else return "";
+    if (len < 4) return "";
+    // Limit scan to the first 1 KB — SPS/PPS always appear at the very start.
+    const size_t scan = (len < 1024) ? len : 1024;
 
-    int h265_type = (nal_byte >> 1) & 0x3F;
-    if (h265_type >= 16 && h265_type <= 40) return "h265";
+    for (size_t i = 0; i + 3 < scan; ) {
+        // Locate next Annex-B start code (3- or 4-byte)
+        size_t sc = 0;
+        if (i + 4 <= scan && data[i]==0 && data[i+1]==0 && data[i+2]==0 && data[i+3]==1)
+            sc = 4;
+        else if (data[i]==0 && data[i+1]==0 && data[i+2]==1)
+            sc = 3;
 
-    int h264_type = nal_byte & 0x1F;
-    if (h264_type == 5 || h264_type == 6 || h264_type == 7 || h264_type == 8)
-        return "h264";
+        if (sc == 0) { ++i; continue; }
 
+        size_t nal_pos = i + sc;
+        if (nal_pos >= scan) break;
+        uint8_t nb = data[nal_pos];
+
+        // ── H.265 NAL unit type (bits [14:9] of the 2-byte header) ───────────
+        // I-frame indicators: IRAP pictures (16-23) and VPS/SPS/PPS (32-34).
+        // AUD = 35 — intentionally excluded so P-frames with AUD are NOT matched.
+        int h5 = (nb >> 1) & 0x3F;
+        if ((h5 >= 16 && h5 <= 23) || (h5 >= 32 && h5 <= 34))
+            return "h265";
+
+        // ── H.264 NAL unit type (bits [4:0]) ─────────────────────────────────
+        // I-frame indicators: IDR (5), SEI (6), SPS (7), PPS (8).
+        // AUD = 9 — intentionally excluded.
+        int h4 = nb & 0x1F;
+        if (h4 >= 5 && h4 <= 8)
+            return "h264";
+
+        i = nal_pos + 1;   // advance past this NAL header, keep scanning
+    }
     return "";
 }
 
@@ -94,10 +126,17 @@ struct FfmpegRecProc {
                   + " -y \"" + filename + "\"";
 
         } else {
+            // MJPEG AVI: decode each JPEG frame then re-encode as MJPEG with a
+            // well-known pixel format.  "-c:v copy" produces AVI files that
+            // Windows Media Foundation rejects (error 0xC00D6D60) because the
+            // FOURCC or chroma layout is unexpected.  Explicit "-c:v mjpeg
+            // -pix_fmt yuvj420p" writes standard baseline MJPEG that Windows
+            // Media Player and most other players handle correctly.
             cmd = "ffmpeg -loglevel warning"
                   " -f image2pipe -vcodec mjpeg"
                   " -framerate " + std::to_string(framerate) +
-                  " -i pipe:0 -c:v copy"
+                  " -i pipe:0"
+                  " -c:v mjpeg -pix_fmt yuvj420p -q:v 3"
                   " -y \"" + filename + "\"";
         }
 
@@ -206,7 +245,17 @@ struct FfmpegRecProc {
     bool wait_for_exit(DWORD timeout_ms) {
         if (hProcess == INVALID_HANDLE_VALUE) return true;
         bool ok = (WaitForSingleObject(hProcess, timeout_ms) == WAIT_OBJECT_0);
-        // Stderr pipe closes when process exits; join reader thread
+        // If timed out, kill the process now.  This closes ffmpeg's write end
+        // of the stderr pipe, which causes ReadFile in stderr_thr to return
+        // EOF — the only reliable way to unblock ReadFile on Windows.
+        // Closing hStderrRead from the outside while stderr_thr is blocked in
+        // ReadFile does NOT reliably abort the call (Windows limitation).
+        if (!ok && hProcess != INVALID_HANDLE_VALUE) {
+            TerminateProcess(hProcess, 0);
+            WaitForSingleObject(hProcess, 2000);
+        }
+        // ffmpeg has now exited (normally or killed); its stderr write end is
+        // closed → ReadFile returns EOF → stderr_thr exits → join is safe.
         if (hStderrRead != INVALID_HANDLE_VALUE) {
             CloseHandle(hStderrRead);
             hStderrRead = INVALID_HANDLE_VALUE;
@@ -359,13 +408,23 @@ struct VideoRecorder::Impl {
                 queue.pop_front();
             }
 
-            // ── MP4: wait for the first I-frame before starting ffmpeg ────────
+            // ── MP4: wait for the first REAL I-frame before starting ffmpeg ──
+            // We rely on NAL byte inspection (rec_detect_codec) rather than the
+            // DVRIP is_iframe flag, which is buggy and always true.  An I-frame
+            // from the camera is a chunk that begins with SPS/PPS/IDR NAL units;
+            // rec_detect_codec returns non-empty only for those.  A P-frame
+            // starts with a non-IDR slice NAL and rec_detect_codec returns "".
             if (fmt == RecordingFormat::MP4 && !ffp_started) {
-                if (!frame.is_iframe) { ++count_dropped; continue; }
-
                 std::string codec = rec_detect_codec(frame.data.data(), frame.data.size());
-                if (codec.empty()) codec = frame.codec_hint;
-                if (codec.empty()) codec = "h265";   // safe default
+                if (codec.empty()) {
+                    // P-frame — drop it and keep waiting for an I-frame
+                    ++count_dropped;
+                    if (count_dropped == 1 || count_dropped % 50 == 0)
+                        log("recorder: waiting for I-frame (%zu frames dropped)...",
+                            count_dropped.load());
+                    continue;
+                }
+                // codec determined from NAL bytes — reliable
 
                 log("recorder: starting ffmpeg  format=mp4  codec=%s  crf=%d  copy=%d",
                     codec.c_str(), RECORDER_CRF, RECORDER_USE_COPY);
@@ -392,10 +451,16 @@ struct VideoRecorder::Impl {
 
             // ── Write frame to ffmpeg stdin ────────────────────────────────────
             if (!ffp.write_data(frame.data.data(), frame.data.size())) {
-                log("recorder: ffmpeg stdin write error — stopping");
+                log("recorder: ffmpeg stdin write error — ffmpeg may have exited");
                 aborted = true; break;
             }
             ++count_written;
+            // Progress heartbeat — logged at 25, 50, 100, 200, … frames
+            {
+                size_t n = count_written.load();
+                if (n == 25 || n == 100 || (n % 250 == 0))
+                    log("recorder: %zu frames written so far", n);
+            }
         }
 
         // ── Finalise or abort ─────────────────────────────────────────────────
@@ -469,6 +534,16 @@ bool VideoRecorder::init(StreamServer* srv) {
 
     d_->initialized = true;
     return true;
+}
+
+bool VideoRecorder::init_standalone() {
+    d_->initialized = true;
+    return true;
+}
+
+void VideoRecorder::feed_raw_frame(const uint8_t* data, size_t size,
+                                    const std::string& codec, bool is_iframe) {
+    d_->feed_raw(data, size, codec, is_iframe);
 }
 
 void VideoRecorder::deinit() {

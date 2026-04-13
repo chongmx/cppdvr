@@ -165,11 +165,9 @@ CPPDVR_API int stream_start(StreamHandle h, const char* stream_type) {
     if (!h) return 0;
     auto* srv = static_cast<cppdvr::StreamServer*>(h);
 
-    // Allow caller to override stream type before starting
-    if (stream_type && *stream_type != '\0') {
-        // Re-create with new config (simplest approach since config is set at construction)
-        // In practice the user passes it at stream_create time; this just re-confirms it.
-    }
+    // Apply stream type override before starting (e.g. "Main", "Sub", "Extra")
+    if (stream_type && *stream_type != '\0')
+        srv->set_stream_type(stream_type);
 
     return srv->start() ? 1 : 0;
 }
@@ -440,6 +438,11 @@ CPPDVR_API int recorder_init_with_stream(RecorderHandle h, StreamHandle stream) 
     return rec_cast(h)->init(stream_cast(stream)) ? 1 : 0;
 }
 
+CPPDVR_API int recorder_init_standalone(RecorderHandle h) {
+    if (!h) return 0;
+    return rec_cast(h)->init_standalone() ? 1 : 0;
+}
+
 CPPDVR_API void recorder_deinit(RecorderHandle h) {
     if (h) rec_cast(h)->deinit();
 }
@@ -457,6 +460,15 @@ CPPDVR_API int recorder_start(RecorderHandle h,
 CPPDVR_API void recorder_feed_jpeg(RecorderHandle h,
                                     const uint8_t* jpeg, size_t size) {
     if (h && jpeg && size) rec_cast(h)->feed_jpeg(jpeg, size);
+}
+
+CPPDVR_API void recorder_feed_raw(RecorderHandle h,
+                                   const uint8_t* data, size_t size,
+                                   const char* codec, int is_iframe) {
+    if (!h || !data || !size) return;
+    rec_cast(h)->feed_raw_frame(data, size,
+                                codec ? codec : "",
+                                is_iframe != 0);
 }
 
 CPPDVR_API void recorder_save(RecorderHandle h) {

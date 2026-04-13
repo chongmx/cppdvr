@@ -291,6 +291,11 @@ CPPDVR_API void recorder_destroy(RecorderHandle h);
 // Returns non-zero on success.
 CPPDVR_API int recorder_init_with_stream(RecorderHandle h, StreamHandle stream);
 
+// Initialise without a StreamServer (standalone / test mode).
+// Raw NAL frames must be injected manually via recorder_feed_raw().
+// Returns non-zero on success (always succeeds).
+CPPDVR_API int recorder_init_standalone(RecorderHandle h);
+
 // Detach from the stream server and release internal resources.
 // Implicitly calls recorder_discard() if recording.
 CPPDVR_API void recorder_deinit(RecorderHandle h);
@@ -309,6 +314,14 @@ CPPDVR_API int  recorder_start(RecorderHandle h,
 // No-op otherwise.
 CPPDVR_API void recorder_feed_jpeg(RecorderHandle h,
                                     const uint8_t* jpeg, size_t size);
+
+// Feed a raw NAL frame (MP4 format, standalone mode).
+// Use after recorder_init_standalone() to inject H264/H265 Annex-B bytes.
+//   codec     : "h264" or "h265" (NULL or "" → auto-detect from NAL bytes)
+//   is_iframe : non-zero if this is an I-frame (hint; NAL scan is authoritative)
+CPPDVR_API void recorder_feed_raw(RecorderHandle h,
+                                   const uint8_t* data, size_t size,
+                                   const char* codec, int is_iframe);
 
 // Finalise and save the output file.
 // Closes ffmpeg stdin and waits up to 10 s for the muxer to flush.

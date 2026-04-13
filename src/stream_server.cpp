@@ -410,6 +410,12 @@ struct StreamServer::Impl {
     std::mutex                raw_frame_cb_mutex;
     StreamServer::RawFrameFn  raw_frame_cb;
 
+    // ── FPS measurement (video frames only, 100-frame sliding window) ─────────
+    // Timestamps of the start and most-recent frame in the current window.
+    // Reset on each camera reconnect so a fresh measurement begins per session.
+    std::chrono::steady_clock::time_point fps_window_start;
+    size_t                                fps_frame_count {0};
+
     void log(const char* fmt, ...) {
         char buf[512];
         va_list ap;
@@ -460,6 +466,7 @@ struct StreamServer::Impl {
                 cam->session_id(), cfg.stream_type.c_str());
 
             raw_queue.closed = false;
+            fps_frame_count  = 0;   // reset FPS measurement for this session
 
             cam->start_monitor(
                 [this](const uint8_t* data, size_t size, const FrameMeta& meta) {
@@ -468,8 +475,25 @@ struct StreamServer::Impl {
 
                     // Fire raw-frame callback for video frames only (skip audio/info).
                     // Used by VideoRecorder for lossless MP4 recording.
-                    if (!meta.type.empty() &&
-                        meta.type != "g711a" && meta.type != "info") {
+                    // Note: meta.type may be empty on some cameras even for valid
+                    // video frames — only exclude known non-video types.
+                    if (meta.type != "g711a" && meta.type != "info") {
+                        // ── FPS measurement: 100-frame sliding window ─────────
+                        auto now = std::chrono::steady_clock::now();
+                        if (fps_frame_count == 0)
+                            fps_window_start = now;
+                        ++fps_frame_count;
+                        if (fps_frame_count % 100 == 0) {
+                            double elapsed = std::chrono::duration<double>(
+                                now - fps_window_start).count();
+                            // 99 inter-frame intervals span 100 frames
+                            double fps = (elapsed > 0.0) ? 99.0 / elapsed : 0.0;
+                            log("DVR: measured FPS = %.2f  "
+                                "(100 frames in %.3f s, total=%zu)",
+                                fps, elapsed, fps_frame_count);
+                            fps_window_start = now;   // slide window forward
+                        }
+
                         std::lock_guard<std::mutex> lk(raw_frame_cb_mutex);
                         if (raw_frame_cb)
                             raw_frame_cb(data, size, meta.type, meta.frame == "I");
@@ -696,6 +720,11 @@ StreamServer::StreamServer(StreamServerConfig config)
 
 StreamServer::~StreamServer() {
     stop();
+}
+
+void StreamServer::set_stream_type(const std::string& stream_type) {
+    if (!d_->running.load())
+        d_->cfg.stream_type = stream_type;
 }
 
 bool StreamServer::start() {

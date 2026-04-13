@@ -52,6 +52,10 @@ public:
     StreamServer(const StreamServer&)            = delete;
     StreamServer& operator=(const StreamServer&) = delete;
 
+    // Override the stream type ("Main", "Sub", "Extra") before calling start().
+    // Has no effect if the server is already running.
+    void set_stream_type(const std::string& stream_type);
+
     // Start background threads (camera, ffmpeg pipeline, HTTP server).
     // Returns true if all threads launched successfully.
     bool start();

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cppdvr VERSION 1.0.0 LANGUAGES CXX)
+project(cppdvr VERSION 1.0.0 LANGUAGES CXX C)
 
 # ── C++ standard ────────────────────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 17)
@@ -81,5 +81,15 @@ if(CPPDVR_BUILD_DEMO)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:cppdvr>
             $<TARGET_FILE_DIR:cppdvr_test_frame>
+    )
+
+    # Recorder MP4 integration test (records from a live DVR stream)
+    add_executable(test_rec_mp4 demo/test_rec_mp4.c)
+    target_link_libraries(test_rec_mp4 PRIVATE cppdvr)
+    target_include_directories(test_rec_mp4 PRIVATE include)
+    add_custom_command(TARGET test_rec_mp4 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:cppdvr>
+            $<TARGET_FILE_DIR:test_rec_mp4>
     )
 endif()
