@@ -60,17 +60,19 @@ static std::string rec_detect_codec(const uint8_t* data, size_t len) {
 // ffmpeg child-process wrapper
 // ════════════════════════════════════════════════════════════════════════════════
 struct FfmpegRecProc {
-    HANDLE hStdinWrite {INVALID_HANDLE_VALUE};
-    HANDLE hProcess    {INVALID_HANDLE_VALUE};
-    HANDLE hProcThread {INVALID_HANDLE_VALUE};
+    HANDLE      hStdinWrite  {INVALID_HANDLE_VALUE};
+    HANDLE      hStderrRead  {INVALID_HANDLE_VALUE};
+    HANDLE      hProcess     {INVALID_HANDLE_VALUE};
+    HANDLE      hProcThread  {INVALID_HANDLE_VALUE};
+    std::thread stderr_thr;
+
+    using LogFn = std::function<void(const char*)>;
 
     // Build and launch the ffmpeg command for the chosen format.
-    //   codec     — "h264" or "h265" (MP4 only; ignored for MJPEG)
-    //   filename  — output file path
-    //   fmt       — RecordingFormat::MP4 or RecordingFormat::MJPEG
-    //   framerate — container FPS hint (MJPEG only)
+    // log_fn receives stderr lines from ffmpeg (errors, warnings).
     bool start(RecordingFormat fmt, const std::string& codec,
-               const std::string& filename, int framerate) {
+               const std::string& filename, int framerate,
+               LogFn log_fn = nullptr) {
 
         std::string cmd;
 
@@ -92,12 +94,24 @@ struct FfmpegRecProc {
                   + " -y \"" + filename + "\"";
 
         } else {
-            // MJPEG: each write is a complete JPEG file
             cmd = "ffmpeg -loglevel warning"
                   " -f image2pipe -vcodec mjpeg"
                   " -framerate " + std::to_string(framerate) +
                   " -i pipe:0 -c:v copy"
                   " -y \"" + filename + "\"";
+        }
+
+        // Resolve the absolute output path and log it so the user knows where
+        // the file will appear (CWD-relative names can be confusing).
+        if (log_fn) {
+            wchar_t abs[MAX_PATH] = {};
+            std::wstring wfn(filename.begin(), filename.end());
+            if (GetFullPathNameW(wfn.c_str(), MAX_PATH, abs, nullptr)) {
+                std::wstring wa(abs);
+                std::string sa(wa.begin(), wa.end());
+                log_fn(("recorder: output -> " + sa).c_str());
+            }
+            log_fn(("recorder: cmd: " + cmd).c_str());
         }
 
         SECURITY_ATTRIBUTES sa{};
@@ -109,7 +123,14 @@ struct FfmpegRecProc {
         if (!CreatePipe(&hStdinR, &hStdinWrite, &sa, 0)) return false;
         SetHandleInformation(hStdinWrite, HANDLE_FLAG_INHERIT, 0);
 
-        // Redirect ffmpeg stdout / stderr to NUL (prevents pipe-buffer stalls)
+        // Stderr pipe — we read ffmpeg error/warning messages
+        HANDLE hStderrWrite{INVALID_HANDLE_VALUE};
+        if (!CreatePipe(&hStderrRead, &hStderrWrite, &sa, 4096)) {
+            close_all(); CloseHandle(hStdinR); return false;
+        }
+        SetHandleInformation(hStderrRead, HANDLE_FLAG_INHERIT, 0);
+
+        // Stdout → NUL (ffmpeg writes the file; stdout not needed)
         HANDLE hNul = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_WRITE,
                                    &sa, OPEN_EXISTING, 0, nullptr);
 
@@ -117,7 +138,7 @@ struct FfmpegRecProc {
         si.cb         = sizeof(si);
         si.hStdInput  = hStdinR;
         si.hStdOutput = (hNul != INVALID_HANDLE_VALUE) ? hNul : INVALID_HANDLE_VALUE;
-        si.hStdError  = (hNul != INVALID_HANDLE_VALUE) ? hNul : INVALID_HANDLE_VALUE;
+        si.hStdError  = hStderrWrite;
         si.dwFlags    = STARTF_USESTDHANDLES;
 
         PROCESS_INFORMATION pi{};
@@ -130,12 +151,37 @@ struct FfmpegRecProc {
         );
 
         CloseHandle(hStdinR);
+        CloseHandle(hStderrWrite);   // child has its own copy; close ours
         if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
 
         if (!ok) { close_all(); return false; }
 
         hProcess    = pi.hProcess;
         hProcThread = pi.hThread;
+
+        // Drain ffmpeg stderr on a background thread so we see errors in the log
+        if (log_fn) {
+            stderr_thr = std::thread([this, log_fn]() {
+                char buf[512];
+                DWORD n = 0;
+                std::string line;
+                while (ReadFile(hStderrRead, buf, sizeof(buf) - 1, &n, nullptr) && n > 0) {
+                    buf[n] = '\0';
+                    line += buf;
+                    // Forward complete lines
+                    size_t pos;
+                    while ((pos = line.find('\n')) != std::string::npos) {
+                        std::string l = line.substr(0, pos);
+                        while (!l.empty() && (l.back() == '\r' || l.back() == '\n'))
+                            l.pop_back();
+                        if (!l.empty()) log_fn(("ffmpeg: " + l).c_str());
+                        line.erase(0, pos + 1);
+                    }
+                }
+                if (!line.empty()) log_fn(("ffmpeg: " + line).c_str());
+            });
+        }
+
         return true;
     }
 
@@ -156,9 +202,17 @@ struct FfmpegRecProc {
     }
 
     // Wait for ffmpeg to exit. Returns true if it exited within timeout_ms.
+    // Also waits for the stderr reader thread to finish.
     bool wait_for_exit(DWORD timeout_ms) {
         if (hProcess == INVALID_HANDLE_VALUE) return true;
-        return WaitForSingleObject(hProcess, timeout_ms) == WAIT_OBJECT_0;
+        bool ok = (WaitForSingleObject(hProcess, timeout_ms) == WAIT_OBJECT_0);
+        // Stderr pipe closes when process exits; join reader thread
+        if (hStderrRead != INVALID_HANDLE_VALUE) {
+            CloseHandle(hStderrRead);
+            hStderrRead = INVALID_HANDLE_VALUE;
+        }
+        if (stderr_thr.joinable()) stderr_thr.join();
+        return ok;
     }
 
     // Hard-kill the ffmpeg process and close all handles.
@@ -168,6 +222,11 @@ struct FfmpegRecProc {
             TerminateProcess(hProcess, 0);
             WaitForSingleObject(hProcess, 2000);
         }
+        if (hStderrRead != INVALID_HANDLE_VALUE) {
+            CloseHandle(hStderrRead);
+            hStderrRead = INVALID_HANDLE_VALUE;
+        }
+        if (stderr_thr.joinable()) stderr_thr.join();
         close_all();
     }
 
@@ -176,6 +235,7 @@ struct FfmpegRecProc {
             if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); h = INVALID_HANDLE_VALUE; }
         };
         cl(hStdinWrite);
+        cl(hStderrRead);
         cl(hProcess);
         cl(hProcThread);
     }
@@ -311,7 +371,7 @@ struct VideoRecorder::Impl {
                     codec.c_str(), RECORDER_CRF, RECORDER_USE_COPY);
                 log("recorder: -> %s", fname.c_str());
 
-                if (!ffp.start(RecordingFormat::MP4, codec, fname, fps)) {
+                if (!ffp.start(RecordingFormat::MP4, codec, fname, fps, [this](const char* m){ log(m); })) {
                     log("recorder: ffmpeg failed to start (is ffmpeg in PATH?)");
                     aborted = true; break;
                 }
@@ -323,7 +383,7 @@ struct VideoRecorder::Impl {
                 log("recorder: starting ffmpeg  format=mjpeg  fps=%d", fps);
                 log("recorder: -> %s", fname.c_str());
 
-                if (!ffp.start(RecordingFormat::MJPEG, "", fname, fps)) {
+                if (!ffp.start(RecordingFormat::MJPEG, "", fname, fps, [this](const char* m){ log(m); })) {
                     log("recorder: ffmpeg failed to start (is ffmpeg in PATH?)");
                     aborted = true; break;
                 }

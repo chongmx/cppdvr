@@ -53,7 +53,7 @@
 
 // ── Quality / tuning constants ─────────────────────────────────────────────────
 #ifndef RECORDER_USE_COPY
-#  define RECORDER_USE_COPY       0        // 0 = re-encode; 1 = stream-copy (MP4 only)
+#  define RECORDER_USE_COPY       1        // 0 = re-encode; 1 = stream-copy (MP4 only)
 #endif
 #ifndef RECORDER_CRF
 #  define RECORDER_CRF            18       // CRF for re-encode (lower = better quality)
