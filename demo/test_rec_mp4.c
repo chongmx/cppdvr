@@ -47,7 +47,7 @@ static int g_fail = 0;
 #define PASS(msg) do { printf("[PASS] %s\n", msg); fflush(stdout); ++g_pass; } while(0)
 #define FAIL(msg) do { printf("[FAIL] %s\n", msg); fflush(stdout); ++g_fail; } while(0)
 #define FAILF(fmt,...) do { printf("[FAIL] " fmt "\n", __VA_ARGS__); fflush(stdout); ++g_fail; } while(0)
-#define INFO(fmt,...) do { printf("       " fmt "\n", __VA_ARGS__); fflush(stdout); } while(0)
+#define INFO(fmt,...) do { printf("       " fmt "\n", ##__VA_ARGS__); fflush(stdout); } while(0)
 #define BANNER(msg) do { printf("\n=== %s ===\n", msg); fflush(stdout); } while(0)
 
 static void stream_log(const char* msg, void* ud) {

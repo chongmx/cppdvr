@@ -38,11 +38,6 @@
  *   [  500 ms] INPUT #1   seq=42  RIGHT active=1  trig=0.00  grip=0.00
  */
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
 #include <atomic>
 #include <chrono>
 #include <climits>

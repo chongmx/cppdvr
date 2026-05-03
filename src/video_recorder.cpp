@@ -11,16 +11,10 @@
  *   Signalling — condition_variable + q_stop / q_abort flags
  */
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <winsock2.h>   // must precede windows.h on MSVC
-#include <windows.h>
-
 #include "video_recorder.h"
+#include "platform/platform_process.h"
+
+#include <filesystem>
 
 #include <atomic>
 #include <cassert>
@@ -89,125 +83,79 @@ static std::string rec_detect_codec(const uint8_t* data, size_t len) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// ffmpeg child-process wrapper
+// ffmpeg child-process wrapper (cross-platform via platform_process)
 // ════════════════════════════════════════════════════════════════════════════════
 struct FfmpegRecProc {
-    HANDLE      hStdinWrite  {INVALID_HANDLE_VALUE};
-    HANDLE      hStderrRead  {INVALID_HANDLE_VALUE};
-    HANDLE      hProcess     {INVALID_HANDLE_VALUE};
-    HANDLE      hProcThread  {INVALID_HANDLE_VALUE};
-    std::thread stderr_thr;
+    PlatformProcess proc        {INVALID_PROCESS};
+    PlatformPipe    stdin_pipe  {INVALID_PIPE};
+    PlatformPipe    stdout_pipe {INVALID_PIPE};   // not used — ffmpeg writes to file
+    PlatformPipe    stderr_pipe {INVALID_PIPE};
+    std::thread     stderr_thr;
 
     using LogFn = std::function<void(const char*)>;
 
-    // Build and launch the ffmpeg command for the chosen format.
-    // log_fn receives stderr lines from ffmpeg (errors, warnings).
     bool start(RecordingFormat fmt, const std::string& codec,
                const std::string& filename, int framerate,
                LogFn log_fn = nullptr) {
 
-        std::string cmd;
+        std::vector<std::string> args = { "-loglevel", "warning" };
 
         if (fmt == RecordingFormat::MP4) {
             const std::string input_fmt = (codec == "h265") ? "hevc" : "h264";
+            args.insert(args.end(), { "-f", input_fmt, "-i", "pipe:0" });
 
-            std::string vcodec_args;
 #if RECORDER_USE_COPY
-            vcodec_args = "-c:v copy";
+            args.insert(args.end(), { "-c:v", "copy" });
 #else
             const std::string enc = (codec == "h265") ? "libx265" : "libx264";
-            vcodec_args = std::string("-c:v ") + enc
-                        + " -crf "    + std::to_string(RECORDER_CRF)
-                        + " -preset " + RECORDER_PRESET;
+            args.insert(args.end(), {
+                "-c:v",    enc,
+                "-crf",    std::to_string(RECORDER_CRF),
+                "-preset", RECORDER_PRESET
+            });
 #endif
-            cmd = "ffmpeg -loglevel warning"
-                  " -f "  + input_fmt + " -i pipe:0 "
-                  + vcodec_args
-                  + " -y \"" + filename + "\"";
+            args.insert(args.end(), { "-y", filename });
 
         } else {
-            // MJPEG AVI: decode each JPEG frame then re-encode as MJPEG with a
-            // well-known pixel format.  "-c:v copy" produces AVI files that
-            // Windows Media Foundation rejects (error 0xC00D6D60) because the
-            // FOURCC or chroma layout is unexpected.  Explicit "-c:v mjpeg
-            // -pix_fmt yuvj420p" writes standard baseline MJPEG that Windows
-            // Media Player and most other players handle correctly.
-            cmd = "ffmpeg -loglevel warning"
-                  " -f image2pipe -vcodec mjpeg"
-                  " -framerate " + std::to_string(framerate) +
-                  " -i pipe:0"
-                  " -c:v mjpeg -pix_fmt yuvj420p -q:v 3"
-                  " -y \"" + filename + "\"";
+            // MJPEG AVI: re-encode with explicit pixel format for broad player compat
+            args.insert(args.end(), {
+                "-f", "image2pipe", "-vcodec", "mjpeg",
+                "-framerate", std::to_string(framerate),
+                "-i", "pipe:0",
+                "-c:v", "mjpeg", "-pix_fmt", "yuvj420p", "-q:v", "3",
+                "-y", filename
+            });
         }
 
-        // Resolve the absolute output path and log it so the user knows where
-        // the file will appear (CWD-relative names can be confusing).
         if (log_fn) {
-            wchar_t abs[MAX_PATH] = {};
-            std::wstring wfn(filename.begin(), filename.end());
-            if (GetFullPathNameW(wfn.c_str(), MAX_PATH, abs, nullptr)) {
-                std::wstring wa(abs);
-                std::string sa(wa.begin(), wa.end());
-                log_fn(("recorder: output -> " + sa).c_str());
+            try {
+                std::string abs = std::filesystem::absolute(filename).string();
+                log_fn(("recorder: output -> " + abs).c_str());
+            } catch (...) {
+                log_fn(("recorder: output -> " + filename).c_str());
             }
+            std::string cmd = "ffmpeg";
+            for (auto& a : args) { cmd += ' '; cmd += a; }
             log_fn(("recorder: cmd: " + cmd).c_str());
         }
 
-        SECURITY_ATTRIBUTES sa{};
-        sa.nLength        = sizeof(sa);
-        sa.bInheritHandle = TRUE;
+        proc = platform_spawn_process("ffmpeg", args, stdin_pipe, stdout_pipe, stderr_pipe);
+        if (proc == INVALID_PROCESS) return false;
 
-        // Stdin pipe — we write raw data to hStdinWrite
-        HANDLE hStdinR{INVALID_HANDLE_VALUE};
-        if (!CreatePipe(&hStdinR, &hStdinWrite, &sa, 0)) return false;
-        SetHandleInformation(hStdinWrite, HANDLE_FLAG_INHERIT, 0);
-
-        // Stderr pipe — we read ffmpeg error/warning messages
-        HANDLE hStderrWrite{INVALID_HANDLE_VALUE};
-        if (!CreatePipe(&hStderrRead, &hStderrWrite, &sa, 4096)) {
-            close_all(); CloseHandle(hStdinR); return false;
+        // ffmpeg writes the output file directly — stdout pipe is not needed
+        if (stdout_pipe != INVALID_PIPE) {
+            platform_close_pipe(stdout_pipe);
+            stdout_pipe = INVALID_PIPE;
         }
-        SetHandleInformation(hStderrRead, HANDLE_FLAG_INHERIT, 0);
 
-        // Stdout → NUL (ffmpeg writes the file; stdout not needed)
-        HANDLE hNul = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_WRITE,
-                                   &sa, OPEN_EXISTING, 0, nullptr);
-
-        STARTUPINFOW si{};
-        si.cb         = sizeof(si);
-        si.hStdInput  = hStdinR;
-        si.hStdOutput = (hNul != INVALID_HANDLE_VALUE) ? hNul : INVALID_HANDLE_VALUE;
-        si.hStdError  = hStderrWrite;
-        si.dwFlags    = STARTF_USESTDHANDLES;
-
-        PROCESS_INFORMATION pi{};
-        std::wstring wcmd(cmd.begin(), cmd.end());
-
-        const BOOL ok = CreateProcessW(
-            nullptr, wcmd.data(), nullptr, nullptr,
-            TRUE, CREATE_NO_WINDOW,
-            nullptr, nullptr, &si, &pi
-        );
-
-        CloseHandle(hStdinR);
-        CloseHandle(hStderrWrite);   // child has its own copy; close ours
-        if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
-
-        if (!ok) { close_all(); return false; }
-
-        hProcess    = pi.hProcess;
-        hProcThread = pi.hThread;
-
-        // Drain ffmpeg stderr on a background thread so we see errors in the log
-        if (log_fn) {
+        if (log_fn && stderr_pipe != INVALID_PIPE) {
             stderr_thr = std::thread([this, log_fn]() {
                 char buf[512];
-                DWORD n = 0;
                 std::string line;
-                while (ReadFile(hStderrRead, buf, sizeof(buf) - 1, &n, nullptr) && n > 0) {
+                int n;
+                while ((n = platform_read_pipe(stderr_pipe, buf, sizeof(buf) - 1)) > 0) {
                     buf[n] = '\0';
                     line += buf;
-                    // Forward complete lines
                     size_t pos;
                     while ((pos = line.find('\n')) != std::string::npos) {
                         std::string l = line.substr(0, pos);
@@ -225,69 +173,54 @@ struct FfmpegRecProc {
     }
 
     bool write_data(const uint8_t* data, size_t len) {
-        if (hStdinWrite == INVALID_HANDLE_VALUE || len == 0) return false;
-        DWORD written = 0;
-        return WriteFile(hStdinWrite, data, static_cast<DWORD>(len),
-                         &written, nullptr) != FALSE
-               && written == static_cast<DWORD>(len);
+        if (stdin_pipe == INVALID_PIPE || len == 0) return false;
+        return platform_write_pipe(stdin_pipe, data, static_cast<int>(len))
+               == static_cast<int>(len);
     }
 
-    // Close stdin gracefully — signals ffmpeg to finalise the container.
+    // Close stdin — signals ffmpeg to finalise the output container.
     void close_stdin() {
-        if (hStdinWrite != INVALID_HANDLE_VALUE) {
-            CloseHandle(hStdinWrite);
-            hStdinWrite = INVALID_HANDLE_VALUE;
+        if (stdin_pipe != INVALID_PIPE) {
+            platform_close_pipe(stdin_pipe);
+            stdin_pipe = INVALID_PIPE;
         }
     }
 
-    // Wait for ffmpeg to exit. Returns true if it exited within timeout_ms.
-    // Also waits for the stderr reader thread to finish.
-    bool wait_for_exit(DWORD timeout_ms) {
-        if (hProcess == INVALID_HANDLE_VALUE) return true;
-        bool ok = (WaitForSingleObject(hProcess, timeout_ms) == WAIT_OBJECT_0);
-        // If timed out, kill the process now.  This closes ffmpeg's write end
-        // of the stderr pipe, which causes ReadFile in stderr_thr to return
-        // EOF — the only reliable way to unblock ReadFile on Windows.
-        // Closing hStderrRead from the outside while stderr_thr is blocked in
-        // ReadFile does NOT reliably abort the call (Windows limitation).
-        if (!ok && hProcess != INVALID_HANDLE_VALUE) {
-            TerminateProcess(hProcess, 0);
-            WaitForSingleObject(hProcess, 2000);
-        }
-        // ffmpeg has now exited (normally or killed); its stderr write end is
-        // closed → ReadFile returns EOF → stderr_thr exits → join is safe.
-        if (hStderrRead != INVALID_HANDLE_VALUE) {
-            CloseHandle(hStderrRead);
-            hStderrRead = INVALID_HANDLE_VALUE;
-        }
+    // Wait up to timeout_ms for ffmpeg to exit; kills it on timeout.
+    // When the process exits its stderr write end closes, which unblocks
+    // stderr_thr's platform_read_pipe and allows the thread to be joined.
+    bool wait_for_exit(int timeout_ms) {
+        if (proc == INVALID_PROCESS) return true;
+        int exit_code = 0;
+        bool ok = (platform_wait_process(proc, exit_code, timeout_ms)
+                   == PlatformProcessError::Success);
+        if (!ok) platform_kill_process(proc);
+        proc = INVALID_PROCESS;
+        // Process exited/killed → its stderr write end is closed →
+        // platform_read_pipe returns 0 → stderr_thr exits naturally → safe to join.
+        // Join before closing the read-end handle to avoid handle-use-after-free.
         if (stderr_thr.joinable()) stderr_thr.join();
+        if (stderr_pipe != INVALID_PIPE) {
+            platform_close_pipe(stderr_pipe);
+            stderr_pipe = INVALID_PIPE;
+        }
         return ok;
     }
 
-    // Hard-kill the ffmpeg process and close all handles.
     void terminate() {
         close_stdin();
-        if (hProcess != INVALID_HANDLE_VALUE) {
-            TerminateProcess(hProcess, 0);
-            WaitForSingleObject(hProcess, 2000);
+        if (proc != INVALID_PROCESS) {
+            platform_kill_process(proc);
+            proc = INVALID_PROCESS;
         }
-        if (hStderrRead != INVALID_HANDLE_VALUE) {
-            CloseHandle(hStderrRead);
-            hStderrRead = INVALID_HANDLE_VALUE;
+        if (stderr_pipe != INVALID_PIPE) {
+            platform_close_pipe(stderr_pipe);
+            stderr_pipe = INVALID_PIPE;
         }
         if (stderr_thr.joinable()) stderr_thr.join();
-        close_all();
     }
 
-    void close_all() {
-        auto cl = [](HANDLE& h) {
-            if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); h = INVALID_HANDLE_VALUE; }
-        };
-        cl(hStdinWrite);
-        cl(hStderrRead);
-        cl(hProcess);
-        cl(hProcThread);
-    }
+    void close_all() { terminate(); }
 };
 
 // ════════════════════════════════════════════════════════════════════════════════

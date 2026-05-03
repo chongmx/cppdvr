@@ -9,24 +9,15 @@
  *   http_thread     : simple HTTP server serving /  /stream  /snapshot
  */
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-
-#pragma comment(lib, "ws2_32.lib")
-
 #include "stream_server.h"
 #include "dvrip.h"
+#include "platform/platform_net.h"
+#include "platform/platform_process.h"
 
 #include <atomic>
 #include <cassert>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -41,35 +32,18 @@
 namespace cppdvr {
 
 // ════════════════════════════════════════════════════════════════════════════════
-// Network helper — ask Windows which local address routes to a destination
+// Network helper — find the local IP that routes to a destination
 // Handles multi-NIC hosts (e.g., WiFi + wired): ensures the TCP connection
 // to the DVR goes out on the interface that is on the same subnet.
 // ════════════════════════════════════════════════════════════════════════════════
 static std::string find_outbound_local_ip(const std::string& dest_ip, int dest_port) {
-    // SIO_ROUTING_INTERFACE_QUERY returns the local sockaddr Windows would use
-    // to reach the given destination — without actually connecting.
-    SOCKET s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s == INVALID_SOCKET) return "";
-
-    sockaddr_in dst{};
-    dst.sin_family = AF_INET;
-    dst.sin_port   = htons(static_cast<u_short>(dest_port));
-    inet_pton(AF_INET, dest_ip.c_str(), &dst.sin_addr);
-
-    sockaddr_in src{};
-    DWORD returned = 0;
-    bool ok = (WSAIoctl(s, SIO_ROUTING_INTERFACE_QUERY,
-                        &dst, static_cast<DWORD>(sizeof(dst)),
-                        &src, static_cast<DWORD>(sizeof(src)),
-                        &returned, nullptr, nullptr) == 0);
-    ::closesocket(s);
-    if (!ok) return "";
-
-    char buf[INET_ADDRSTRLEN] = {};
-    inet_ntop(AF_INET, &src.sin_addr, buf, sizeof(buf));
+    std::string local_ip;
+    if (platform_get_local_ip_for_remote(dest_ip, local_ip) != PlatformSocketError::Success) {
+        return "";
+    }
     // 0.0.0.0 means "any interface" — not useful for explicit binding
-    if (std::strcmp(buf, "0.0.0.0") == 0) return "";
-    return buf;
+    if (local_ip == "0.0.0.0") return "";
+    return local_ip;
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -165,124 +139,72 @@ struct LatestJpeg {
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
-// ffmpeg process wrapper (Windows CreateProcess)
+// ffmpeg process wrapper (cross-platform via platform_process)
 // ════════════════════════════════════════════════════════════════════════════════
 struct FfmpegProc {
-    HANDLE hStdinWrite  {INVALID_HANDLE_VALUE};
-    HANDLE hStdoutRead  {INVALID_HANDLE_VALUE};
-    HANDLE hStderrRead  {INVALID_HANDLE_VALUE};
-    HANDLE hProcess     {INVALID_HANDLE_VALUE};
-    HANDLE hThread_proc {INVALID_HANDLE_VALUE};
+    PlatformProcess proc        {INVALID_PROCESS};
+    PlatformPipe    stdin_pipe  {INVALID_PIPE};
+    PlatformPipe    stdout_pipe {INVALID_PIPE};
+    PlatformPipe    stderr_pipe {INVALID_PIPE};
 
     bool start(const std::string& codec, int jpeg_quality,
                int jpeg_scale_w = 0, int jpeg_scale_h = 0) {
-        // Map DVRIP codec name to ffmpeg format name
         std::string fmt = "h264";
-        if (codec == "h265") fmt = "hevc";
+        if (codec == "h265")  fmt = "hevc";
         else if (codec == "mpeg4") fmt = "mpeg4";
 
-        // Scale filter: use cfg.scale_width/height to resize before JPEG encode.
-        // -1 on one dimension keeps the aspect ratio (e.g. "scale=416:-1").
-        // Leave both 0 to pass the native camera resolution through unchanged.
-        std::string scale_filter;
+        std::vector<std::string> args = {
+            "-loglevel", "warning",
+            "-f", fmt, "-i", "pipe:0"
+        };
+
+        // Optional scale filter
         if (jpeg_scale_w > 0 || jpeg_scale_h > 0) {
             int w = jpeg_scale_w > 0 ? jpeg_scale_w : -1;
             int h = jpeg_scale_h > 0 ? jpeg_scale_h : -1;
-            scale_filter = std::string(" -vf scale=") + std::to_string(w)
-                         + ":" + std::to_string(h);
+            args.push_back("-vf");
+            args.push_back("scale=" + std::to_string(w) + ":" + std::to_string(h));
         }
 
-        std::string cmd =
-            "ffmpeg -loglevel warning"
-            " -f " + fmt + " -i pipe:0"
-            + scale_filter +
-            " -f mjpeg -q:v " + std::to_string(jpeg_quality) +
-            " pipe:1";
+        args.push_back("-f");
+        args.push_back("mjpeg");
+        args.push_back("-q:v");
+        args.push_back(std::to_string(jpeg_quality));
+        args.push_back("pipe:1");
 
-        SECURITY_ATTRIBUTES sa{};
-        sa.nLength        = sizeof(sa);
-        sa.bInheritHandle = TRUE;
-
-        // Create pipes
-        HANDLE hStdinR, hStdoutW, hStderrW;
-        if (!CreatePipe(&hStdinR,   &hStdinWrite,  &sa, 0))    return false;
-        if (!CreatePipe(&hStdoutRead, &hStdoutW,   &sa, 65536)) { close_handles(); return false; }
-        if (!CreatePipe(&hStderrRead, &hStderrW,   &sa, 4096))  { close_handles(); return false; }
-
-        // Don't inherit our ends
-        SetHandleInformation(hStdinWrite,   HANDLE_FLAG_INHERIT, 0);
-        SetHandleInformation(hStdoutRead,   HANDLE_FLAG_INHERIT, 0);
-        SetHandleInformation(hStderrRead,   HANDLE_FLAG_INHERIT, 0);
-
-        STARTUPINFOW si{};
-        si.cb          = sizeof(si);
-        si.hStdInput   = hStdinR;
-        si.hStdOutput  = hStdoutW;
-        si.hStdError   = hStderrW;
-        si.dwFlags     = STARTF_USESTDHANDLES;
-
-        PROCESS_INFORMATION pi{};
-
-        // Convert to wide string
-        std::wstring wcmd(cmd.begin(), cmd.end());
-
-        BOOL ok = CreateProcessW(
-            nullptr, wcmd.data(), nullptr, nullptr,
-            TRUE,                   // inherit handles
-            CREATE_NO_WINDOW,
-            nullptr, nullptr, &si, &pi
-        );
-
-        // Close child-side handles in parent
-        CloseHandle(hStdinR);
-        CloseHandle(hStdoutW);
-        CloseHandle(hStderrW);
-
-        if (!ok) { close_handles(); return false; }
-
-        hProcess      = pi.hProcess;
-        hThread_proc  = pi.hThread;
-        return true;
+        proc = platform_spawn_process("ffmpeg", args, stdin_pipe, stdout_pipe, stderr_pipe);
+        return proc != INVALID_PROCESS;
     }
 
     bool write(const uint8_t* data, size_t len) {
-        if (hStdinWrite == INVALID_HANDLE_VALUE) return false;
-        DWORD written = 0;
-        return WriteFile(hStdinWrite, data, static_cast<DWORD>(len),
-                         &written, nullptr) && written == len;
+        if (stdin_pipe == INVALID_PIPE || len == 0) return false;
+        return platform_write_pipe(stdin_pipe, data, static_cast<int>(len))
+               == static_cast<int>(len);
     }
 
-    // Read up to 'buf_size' bytes from stdout (non-blocking peek).
+    // Blocking read from stdout — returns 0 on EOF, <0 on error.
     int read(uint8_t* buf, size_t buf_size) {
-        if (hStdoutRead == INVALID_HANDLE_VALUE) return -1;
-        DWORD avail = 0;
-        if (!PeekNamedPipe(hStdoutRead, nullptr, 0, nullptr, &avail, nullptr))
-            return -1;
-        if (avail == 0) return 0;
-        DWORD to_read = (avail < static_cast<DWORD>(buf_size))
-                      ? avail : static_cast<DWORD>(buf_size);
-        DWORD nread = 0;
-        if (!ReadFile(hStdoutRead, buf, to_read, &nread, nullptr)) return -1;
-        return static_cast<int>(nread);
+        if (stdout_pipe == INVALID_PIPE) return -1;
+        return platform_read_pipe(stdout_pipe, buf, static_cast<int>(buf_size));
     }
 
     void terminate() {
-        if (hProcess != INVALID_HANDLE_VALUE) {
-            TerminateProcess(hProcess, 0);
-            WaitForSingleObject(hProcess, 2000);
+        if (stdin_pipe != INVALID_PIPE) {
+            platform_close_pipe(stdin_pipe);
+            stdin_pipe = INVALID_PIPE;
         }
-        close_handles();
-    }
-
-    void close_handles() {
-        auto close_if = [](HANDLE& h) {
-            if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); h = INVALID_HANDLE_VALUE; }
-        };
-        close_if(hStdinWrite);
-        close_if(hStdoutRead);
-        close_if(hStderrRead);
-        close_if(hProcess);
-        close_if(hThread_proc);
+        if (proc != INVALID_PROCESS) {
+            platform_kill_process(proc);
+            proc = INVALID_PROCESS;
+        }
+        if (stdout_pipe != INVALID_PIPE) {
+            platform_close_pipe(stdout_pipe);
+            stdout_pipe = INVALID_PIPE;
+        }
+        if (stderr_pipe != INVALID_PIPE) {
+            platform_close_pipe(stderr_pipe);
+            stderr_pipe = INVALID_PIPE;
+        }
     }
 };
 
@@ -303,21 +225,20 @@ static const char k_index_html[] =
     "<p><a href=\"/snapshot\">snapshot</a></p>"
     "</body></html>";
 
-static void send_all(SOCKET s, const char* data, size_t len) {
+static void send_all(PlatformSocket s, const char* data, size_t len) {
     while (len > 0) {
-        int r = ::send(s, data, static_cast<int>(len), 0);
-        if (r == SOCKET_ERROR) break;
+        int r = platform_send(s, data, static_cast<int>(len), 30000);
+        if (r <= 0) break;
         data += r;
         len  -= r;
     }
 }
 
-static void http_serve_client(SOCKET client, LatestJpeg* latest,
+static void http_serve_client(PlatformSocket client, LatestJpeg* latest,
                                std::atomic<bool>* running) {
-    // Read request line (enough to identify path)
     char req_buf[1024] = {};
-    int  nread = ::recv(client, req_buf, sizeof(req_buf) - 1, 0);
-    if (nread <= 0) { ::closesocket(client); return; }
+    int  nread = platform_recv(client, req_buf, sizeof(req_buf) - 1, 30000);
+    if (nread <= 0) { platform_close(client); return; }
 
     std::string req(req_buf, static_cast<size_t>(nread));
     bool is_stream   = req.find("GET /stream")   != std::string::npos;
@@ -380,7 +301,7 @@ static void http_serve_client(SOCKET client, LatestJpeg* latest,
         send_all(client, k_index_html, sizeof(k_index_html) - 1);
     }
 
-    ::closesocket(client);
+    platform_close(client);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -396,7 +317,7 @@ struct StreamServer::Impl {
     std::thread            camera_thread;
     std::thread            pipeline_thread;
     std::thread            http_thread;
-    SOCKET                 http_server_sock{INVALID_SOCKET};
+    PlatformSocket         http_server_sock{INVALID_PLATFORM_SOCKET};
 
     // ── Log callback ──────────────────────────────────────────────────────────
     std::mutex             log_mutex;
@@ -580,20 +501,16 @@ struct StreamServer::Impl {
             // Feed first frame
             ffmpeg.write(first_iframe.data.data(), first_iframe.data.size());
 
-            // Reader thread: extract JPEG frames from ffmpeg stdout
+            // Reader thread: extract JPEG frames from ffmpeg stdout (blocking read)
             std::atomic<bool> pipe_ok{true};
             std::thread reader([&]() {
                 std::vector<uint8_t> buf;
                 buf.reserve(512 * 1024);
 
                 uint8_t chunk[8192];
-                while (running.load() && pipe_ok.load()) {
+                while (true) {
                     int n = ffmpeg.read(chunk, sizeof(chunk));
-                    if (n < 0) { pipe_ok.store(false); break; }
-                    if (n == 0) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                        continue;
-                    }
+                    if (n <= 0) { pipe_ok.store(false); break; }  // EOF or error
                     buf.insert(buf.end(), chunk, chunk + n);
 
                     // Extract complete JPEG frames (\xFF\xD8 ... \xFF\xD9)
@@ -663,48 +580,40 @@ struct StreamServer::Impl {
 
     // ── HTTP server thread ────────────────────────────────────────────────────
     void run_http() {
-        SOCKET srv = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (srv == INVALID_SOCKET) return;
+        platform_net_init();
+
+        PlatformSocket srv = platform_socket();
+        if (srv == INVALID_PLATFORM_SOCKET) return;
         http_server_sock = srv;
 
-        // Allow quick restart
-        int opt = 1;
-        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR,
-                   reinterpret_cast<const char*>(&opt), sizeof(opt));
+        platform_set_reuseaddr(srv);
 
-        sockaddr_in addr{};
-        addr.sin_family      = AF_INET;
-        addr.sin_port        = htons(static_cast<u_short>(cfg.http_port));
-        addr.sin_addr.s_addr = INADDR_ANY;
-
-        if (::bind(srv, reinterpret_cast<sockaddr*>(&addr), sizeof(addr))
-                == SOCKET_ERROR) {
+        if (platform_bind(srv, "0.0.0.0", static_cast<uint16_t>(cfg.http_port))
+                != PlatformSocketError::Success) {
             log("HTTP: bind failed on port %d (port in use?)", cfg.http_port);
-            ::closesocket(srv);
-            http_server_sock = INVALID_SOCKET;
+            platform_close(srv);
+            http_server_sock = INVALID_PLATFORM_SOCKET;
             return;
         }
 
-        ::listen(srv, SOMAXCONN);
+        platform_listen(srv, 16);
         log("HTTP: listening on port %d  →  http://localhost:%d/stream",
             cfg.http_port, cfg.http_port);
 
-        // Set accept timeout so we can check running flag
-        DWORD ms = 500;
-        setsockopt(srv, SOL_SOCKET, SO_RCVTIMEO,
-                   reinterpret_cast<const char*>(&ms), sizeof(ms));
+        // 500 ms accept timeout — lets us check running flag periodically
+        platform_set_recv_timeout(srv, 500);
 
         while (running.load()) {
-            SOCKET client = ::accept(srv, nullptr, nullptr);
-            if (client == INVALID_SOCKET) continue;  // timeout or error
+            PlatformSocket client = platform_accept(srv);
+            if (client == INVALID_PLATFORM_SOCKET) continue;  // timeout or error
 
             std::thread([client, this]() {
                 http_serve_client(client, &latest_jpeg, &running);
             }).detach();
         }
 
-        ::closesocket(srv);
-        http_server_sock = INVALID_SOCKET;
+        platform_close(srv);
+        http_server_sock = INVALID_PLATFORM_SOCKET;
     }
 };
 
@@ -745,8 +654,8 @@ void StreamServer::stop() {
     d_->raw_queue.close();
 
     // Unblock HTTP server accept
-    if (d_->http_server_sock != INVALID_SOCKET)
-        ::closesocket(d_->http_server_sock);
+    if (d_->http_server_sock != INVALID_PLATFORM_SOCKET)
+        platform_close(d_->http_server_sock);
 
     if (d_->camera_thread.joinable())   d_->camera_thread.join();
     if (d_->pipeline_thread.joinable()) d_->pipeline_thread.join();

@@ -20,17 +20,8 @@
  *   0x05  Composite     sendComposite()
  */
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
-
 #include "udp_stream_server.h"
+#include "platform/platform_net.h"
 
 #include <atomic>
 #include <chrono>
@@ -218,7 +209,7 @@ struct UdpStreamServer::Impl {
     // ── State ───────────────────────────────────────────────────────────────────
     std::atomic<bool>     initialized{false};
     std::atomic<bool>     running{false};
-    SOCKET                sock{INVALID_SOCKET};
+    PlatformSocket        sock{INVALID_PLATFORM_SOCKET};
     std::thread           recv_thread;
 
     // Target IP discovered from first valid inbound packet
@@ -267,46 +258,30 @@ struct UdpStreamServer::Impl {
         return target_ip_discovered;
     }
 
-    void maybe_set_discovered_ip(const sockaddr_in& from) {
+    void maybe_set_discovered_ip(const std::string& ip) {
         if (!target_ip.empty()) return;  // static override — ignore
         std::lock_guard<std::mutex> lk(target_mtx);
         if (!target_ip_discovered.empty()) return;  // already set
-        char ipbuf[INET_ADDRSTRLEN] = {};
-        inet_ntop(AF_INET, &from.sin_addr, ipbuf, sizeof(ipbuf));
-        // Skip our own loopback debug reflections
-        if (std::strcmp(ipbuf, "127.0.0.1") == 0) return;
-        target_ip_discovered = ipbuf;
-        log("UDP: auto-discovered target IP %s  (will TX to port %d)", ipbuf, tx_port);
+        target_ip_discovered = ip;
+        log("UDP: auto-discovered target IP %s  (will TX to port %d)", ip.c_str(), tx_port);
     }
 
     // ── Low-level send ──────────────────────────────────────────────────────────
-    // Sends datagram to the headset (and optionally to localhost for debug).
     bool do_send(const uint8_t* data, int len) {
-        if (sock == INVALID_SOCKET || len <= 0) return false;
+        if (sock == INVALID_PLATFORM_SOCKET || len <= 0) return false;
 
         bool ok = false;
         const std::string hip = get_target_ip();
 
         if (!hip.empty()) {
-            sockaddr_in dst{};
-            dst.sin_family = AF_INET;
-            dst.sin_port   = htons(static_cast<u_short>(tx_port));
-            inet_pton(AF_INET, hip.c_str(), &dst.sin_addr);
-            int r = ::sendto(sock, reinterpret_cast<const char*>(data), len, 0,
-                             reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
-            ok = (r != SOCKET_ERROR);
+            int r = platform_sendto(sock, hip, static_cast<uint16_t>(tx_port), data, len);
+            ok = (r > 0);
         }
 
         if (localhost_debug) {
-            // Mirror to 127.0.0.1:rx_port so a local Python viewer can inspect it.
-            // NOTE: these loopback packets arrive on our own recv socket; they are
-            // filtered out in run_recv() by checking the source address.
-            sockaddr_in lo{};
-            lo.sin_family      = AF_INET;
-            lo.sin_port        = htons(static_cast<u_short>(rx_port));
-            lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            ::sendto(sock, reinterpret_cast<const char*>(data), len, 0,
-                     reinterpret_cast<sockaddr*>(&lo), sizeof(lo));
+            // Mirror to 127.0.0.1:rx_port so a local viewer can inspect it.
+            // These loopback packets are filtered in run_recv() by source address.
+            platform_sendto(sock, "127.0.0.1", static_cast<uint16_t>(rx_port), data, len);
         }
 
         return ok;
@@ -318,28 +293,20 @@ struct UdpStreamServer::Impl {
         std::vector<uint8_t> buf(65536);
 
         while (running.load()) {
-            sockaddr_in from{};
-            int from_len = sizeof(from);
+            std::string remote_ip;
+            uint16_t    remote_port = 0;
 
-            int n = ::recvfrom(sock,
-                               reinterpret_cast<char*>(buf.data()),
-                               static_cast<int>(buf.size()),
-                               0,
-                               reinterpret_cast<sockaddr*>(&from),
-                               &from_len);
+            // 200 ms timeout — lets us check running flag without blocking forever
+            int n = platform_recvfrom(sock, buf.data(), static_cast<int>(buf.size()),
+                                      200, remote_ip, remote_port);
 
             if (n <= 0) {
-                int err = WSAGetLastError();
-                // WSAETIMEDOUT / WSAEWOULDBLOCK are normal (SO_RCVTIMEO)
-                if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) continue;
-                if (!running.load()) break;   // socket closed by deinit()
-                // Real error — log and keep trying
-                log("UDP RX: recvfrom error %d", err);
-                continue;
+                if (!running.load()) break;
+                continue;  // timeout or transient error — keep looping
             }
 
             // Discard our own loopback debug reflections
-            if (from.sin_addr.s_addr == htonl(INADDR_LOOPBACK)) continue;
+            if (remote_ip == "127.0.0.1") continue;
 
             if (n < static_cast<int>(kUdpHeaderSize)) continue;
 
@@ -352,7 +319,7 @@ struct UdpStreamServer::Impl {
             const uint64_t ts_us = read_u64le(buf.data() + 10);
 
             // Auto-discover headset IP
-            maybe_set_discovered_ip(from);
+            maybe_set_discovered_ip(remote_ip);
 
             // ── Dispatch by packet type ──────────────────────────────────────
             if (ptype == UDP_PKT_INPUT_AND_GUI) {
@@ -479,42 +446,33 @@ void UdpStreamServer::setLogCallback(UdpLogFn fn) {
 bool UdpStreamServer::init() {
     if (d_->initialized.load()) return true;   // already open
 
-    // Create UDP socket
-    SOCKET s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s == INVALID_SOCKET) {
-        d_->log("UDP init: socket() failed (WSA %d)", WSAGetLastError());
+    platform_net_init();
+
+    PlatformSocket s = platform_udp_socket();
+    if (s == INVALID_PLATFORM_SOCKET) {
+        d_->log("UDP init: socket() failed");
         return false;
     }
 
     // SO_REUSEADDR — allows quick restart without "port in use" errors
-    int opt = 1;
-    ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
-                 reinterpret_cast<const char*>(&opt), sizeof(opt));
+    platform_set_reuseaddr(s);
 
     // SO_RCVTIMEO — unblocks recvfrom periodically so the thread can check 'running'
-    DWORD timeout_ms = 200;
-    ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
-                 reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+    platform_set_recv_timeout(s, 200);
 
-    // Bind to local_ip:rx_port
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(static_cast<u_short>(d_->rx_port));
-    inet_pton(AF_INET,
-              d_->local_ip.empty() ? "0.0.0.0" : d_->local_ip.c_str(),
-              &addr.sin_addr);
-
-    if (::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
-        d_->log("UDP init: bind() failed on %s:%d (WSA %d)",
-                d_->local_ip.c_str(), d_->rx_port, WSAGetLastError());
-        ::closesocket(s);
+    const std::string bind_ip = d_->local_ip.empty() ? "0.0.0.0" : d_->local_ip;
+    if (platform_bind(s, bind_ip, static_cast<uint16_t>(d_->rx_port))
+            != PlatformSocketError::Success) {
+        d_->log("UDP init: bind() failed on %s:%d",
+                bind_ip.c_str(), d_->rx_port);
+        platform_close(s);
         return false;
     }
 
     d_->sock = s;
     d_->initialized.store(true);
     d_->log("UDP: socket bound to %s:%d  TX→%s:%d",
-            d_->local_ip.c_str(), d_->rx_port,
+            bind_ip.c_str(), d_->rx_port,
             d_->target_ip.empty() ? "(auto)" : d_->target_ip.c_str(),
             d_->tx_port);
     return true;
@@ -542,9 +500,9 @@ void UdpStreamServer::stop() {
 void UdpStreamServer::deinit() {
     stop();   // join receive thread first
 
-    if (d_->sock != INVALID_SOCKET) {
-        ::closesocket(d_->sock);
-        d_->sock = INVALID_SOCKET;
+    if (d_->sock != INVALID_PLATFORM_SOCKET) {
+        platform_close(d_->sock);
+        d_->sock = INVALID_PLATFORM_SOCKET;
     }
     d_->initialized.store(false);
     d_->target_ip_discovered.clear();

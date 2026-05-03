@@ -9,21 +9,9 @@
  *   - Auth: Sofia hash (custom MD5-derived encoding)
  */
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#include <wincrypt.h>
-
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "crypt32.lib")
-
 #include "dvrip.h"
+#include "platform/platform_net.h"
+#include "platform/platform_crypto.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -94,13 +82,6 @@ static void unpack_datetime(uint32_t v, FrameMeta::dt_type& dt) {
     dt.year   = ((v >> 26) & 0x3F) + 2000;
 }
 
-// ── WSA RAII guard ─────────────────────────────────────────────────────────────
-struct WsaGuard {
-    WsaGuard()  { WSADATA w; WSAStartup(MAKEWORD(2, 2), &w); }
-    ~WsaGuard() { WSACleanup(); }
-};
-static WsaGuard g_wsa;   // initialised at load time
-
 // ════════════════════════════════════════════════════════════════════════════════
 // DVRIPCam::Impl — private implementation (PIMPL)
 // ════════════════════════════════════════════════════════════════════════════════
@@ -115,7 +96,7 @@ struct DVRIPCam::Impl {
     std::string bind_ip;   // local IP to bind before connect (multi-NIC)
 
     // Socket
-    SOCKET      sock{INVALID_SOCKET};
+    PlatformSocket sock{INVALID_PLATFORM_SOCKET};
 
     // Protocol state
     uint32_t    session{0};
@@ -154,12 +135,11 @@ struct DVRIPCam::Impl {
     // ── Low-level I/O ──────────────────────────────────────────────────────────
 
     bool tcp_send(const uint8_t* data, size_t len) {
-        if (sock == INVALID_SOCKET) return false;
+        if (sock == INVALID_PLATFORM_SOCKET) return false;
         int sent = 0;
         while (static_cast<size_t>(sent) < len) {
-            int r = ::send(sock, reinterpret_cast<const char*>(data) + sent,
-                           static_cast<int>(len - sent), 0);
-            if (r == SOCKET_ERROR) return false;
+            int r = platform_send(sock, data + sent, static_cast<int>(len - sent), timeout_sec * 1000);
+            if (r <= 0) return false;
             sent += r;
         }
         return true;
@@ -175,9 +155,8 @@ struct DVRIPCam::Impl {
         auto deadline = std::chrono::steady_clock::now()
                       + std::chrono::seconds(timeout_sec);
         while (received < len) {
-            int r = ::recv(sock,
-                           reinterpret_cast<char*>(buf.data()) + received,
-                           static_cast<int>(len - received), 0);
+            int r = platform_recv(sock, buf.data() + received, 
+                                 static_cast<int>(len - received), timeout_sec * 1000);
             if (r <= 0) {
                 recv_failed.store(true);   // socket-level error / EOF
                 buf.clear();
@@ -229,7 +208,7 @@ struct DVRIPCam::Impl {
     // wait_response=false: send only (no reply read). Returns empty json {}.
     json send_msg(uint16_t msg_id, const json& data = json::object(),
                   bool wait_response = true, uint8_t version = 0) {
-        if (sock == INVALID_SOCKET) return { {"Ret", 101} };
+        if (sock == INVALID_PLATFORM_SOCKET) return { {"Ret", 101} };
 
         std::unique_lock<std::mutex> lock(send_mutex);
 
@@ -395,7 +374,7 @@ struct DVRIPCam::Impl {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
 
             if (!keepalive_run.load()) break;
-            if (sock == INVALID_SOCKET) break;
+            if (sock == INVALID_PLATFORM_SOCKET) break;
 
             char session_str[16];
             std::snprintf(session_str, sizeof(session_str),
@@ -408,9 +387,9 @@ struct DVRIPCam::Impl {
 
             if (ret.empty() || ret.value("Ret", 101) == 101) {
                 last_err = "keep-alive failed — closing";
-                if (sock != INVALID_SOCKET) {
-                    ::closesocket(sock);
-                    sock = INVALID_SOCKET;
+                if (sock != INVALID_PLATFORM_SOCKET) {
+                    platform_close(sock);
+                    sock = INVALID_PLATFORM_SOCKET;
                 }
                 break;
             }
@@ -514,22 +493,10 @@ struct DVRIPCam::Impl {
 // MD5(password)  →  pair even/odd bytes  →  sum mod 62  →  alphanumeric char
 // ════════════════════════════════════════════════════════════════════════════════
 std::string DVRIPCam::sofia_hash(const std::string& password) {
-    uint8_t  md5[16] = {};
-    DWORD    hashLen  = 16;
-    HCRYPTPROV hProv  = 0;
-    HCRYPTHASH hHash  = 0;
-
-    if (CryptAcquireContextW(&hProv, nullptr, nullptr,
-                              PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-        if (CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash)) {
-            if (!password.empty())
-                CryptHashData(hHash,
-                              reinterpret_cast<const BYTE*>(password.data()),
-                              static_cast<DWORD>(password.size()), 0);
-            CryptGetHashParam(hHash, HP_HASHVAL, md5, &hashLen, 0);
-            CryptDestroyHash(hHash);
-        }
-        CryptReleaseContext(hProv, 0);
+    uint8_t md5[PLATFORM_MD5_DIGEST_SIZE] = {};
+    
+    if (platform_md5(password.data(), static_cast<int>(password.size()), md5) != 0) {
+        return "";
     }
 
     static const char chars[] =
@@ -565,41 +532,29 @@ DVRIPCam::~DVRIPCam() {
 bool DVRIPCam::connect(int timeout_sec) {
     d_->timeout_sec = timeout_sec;
 
-    SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) {
+    // Initialize platform networking
+    platform_net_init();
+
+    PlatformSocket s = platform_socket();
+    if (s == INVALID_PLATFORM_SOCKET) {
         d_->last_err = "socket() failed";
         return false;
     }
 
-    // Set send/recv timeout
-    DWORD ms = static_cast<DWORD>(timeout_sec * 1000);
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&ms), sizeof(ms));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&ms), sizeof(ms));
-
     // Bind to a specific local IP when the host has multiple NICs.
-    // Without this, Windows may route through the wrong interface (e.g., WiFi
-    // instead of the wired adapter that's on the same subnet as the camera).
+    // Without this, routing may happen through the wrong interface.
     if (!d_->bind_ip.empty()) {
-        sockaddr_in local{};
-        local.sin_family      = AF_INET;
-        local.sin_port        = 0;  // OS assigns ephemeral port
-        inet_pton(AF_INET, d_->bind_ip.c_str(), &local.sin_addr);
-        if (::bind(s, reinterpret_cast<sockaddr*>(&local), sizeof(local))
-                == SOCKET_ERROR) {
-            ::closesocket(s);
+        if (platform_bind(s, d_->bind_ip, 0) != PlatformSocketError::Success) {
+            platform_close(s);
             d_->last_err = "bind() to local IP " + d_->bind_ip + " failed";
             return false;
         }
     }
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(static_cast<u_short>(d_->port));
-    inet_pton(AF_INET, d_->ip.c_str(), &addr.sin_addr);
-
-    if (::connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr))
-            == SOCKET_ERROR) {
-        ::closesocket(s);
+    // Connect to DVR
+    PlatformSocketError err = platform_connect(s, d_->ip, d_->port, timeout_sec * 1000);
+    if (err != PlatformSocketError::Success) {
+        platform_close(s);
         d_->last_err = "connect() failed";
         return false;
     }
@@ -613,14 +568,14 @@ void DVRIPCam::close() {
     if (d_->keepalive_thread.joinable())
         d_->keepalive_thread.join();
 
-    if (d_->sock != INVALID_SOCKET) {
-        ::closesocket(d_->sock);
-        d_->sock = INVALID_SOCKET;
+    if (d_->sock != INVALID_PLATFORM_SOCKET) {
+        platform_close(d_->sock);
+        d_->sock = INVALID_PLATFORM_SOCKET;
     }
 }
 
 bool DVRIPCam::login() {
-    if (d_->sock == INVALID_SOCKET)
+    if (d_->sock == INVALID_PLATFORM_SOCKET)
         if (!connect()) return false;
 
     char session_str[16] = "0x00000000";
@@ -653,7 +608,7 @@ bool DVRIPCam::login() {
     return true;
 }
 
-bool DVRIPCam::is_connected()  const { return d_->sock != INVALID_SOCKET; }
+bool DVRIPCam::is_connected()  const { return d_->sock != INVALID_PLATFORM_SOCKET; }
 bool DVRIPCam::is_monitoring() const { return d_->monitoring.load(); }
 
 bool DVRIPCam::start_monitor(FrameCallback callback,
@@ -681,8 +636,10 @@ bool DVRIPCam::start_monitor(FrameCallback callback,
 void DVRIPCam::stop_monitor() {
     d_->monitoring.store(false);
     // Unblock any pending recv by closing the socket
-    if (d_->sock != INVALID_SOCKET) {
-        ::shutdown(d_->sock, SD_BOTH);
+    if (d_->sock != INVALID_PLATFORM_SOCKET) {
+        // Close socket to unblock any pending recv()
+        platform_close(d_->sock);
+        d_->sock = INVALID_PLATFORM_SOCKET;
     }
     if (d_->monitor_thread.joinable())
         d_->monitor_thread.join();
