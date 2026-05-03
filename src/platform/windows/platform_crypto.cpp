@@ -69,6 +69,10 @@ int platform_md5_update(PlatformMD5Context ctx, const void* data, int len) {
         return -1;
     }
 
+    // CryptHashData fails with cbData=0; skip it — the hash state is already
+    // the MD5 of empty input, which is the correct result for an empty password.
+    if (len == 0) return 0;
+
     if (!CryptHashData(internal->hHash, (const BYTE*)data, static_cast<DWORD>(len), 0)) {
         return -1;
     }
