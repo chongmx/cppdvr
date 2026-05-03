@@ -218,7 +218,7 @@ PlatformProcessError platform_wait_process(PlatformProcess proc, int& exit_code,
     // Remove from tracking map
     {
         std::lock_guard<std::mutex> lock(g_process_mutex);
-        intptr_t proc_id = reinterpret_cast<intptr_t>(proc);
+        intptr_t proc_id = static_cast<intptr_t>(proc);
         g_process_handles.erase(proc_id);
     }
 
@@ -245,7 +245,7 @@ PlatformProcessError platform_kill_process(PlatformProcess proc) {
     // Remove from tracking map
     {
         std::lock_guard<std::mutex> lock(g_process_mutex);
-        intptr_t proc_id = reinterpret_cast<intptr_t>(proc);
+        intptr_t proc_id = static_cast<intptr_t>(proc);
         g_process_handles.erase(proc_id);
     }
 
@@ -275,7 +275,7 @@ bool platform_process_is_running(PlatformProcess proc) {
 
     {
         std::lock_guard<std::mutex> lock(g_process_mutex);
-        intptr_t proc_id = reinterpret_cast<intptr_t>(proc);
+        intptr_t proc_id = static_cast<intptr_t>(proc);
         g_process_handles.erase(proc_id);
     }
 
