@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
+
+# Guard against being included twice (e.g. via add_subdirectory + find_package)
+if(TARGET cppdvr)
+    return()
+endif()
+
 project(cppdvr VERSION 1.0.0 LANGUAGES CXX C)
 
 # ── C++ standard ────────────────────────────────────────────────────────────────
@@ -78,6 +84,7 @@ elseif(UNIX)
             list(APPEND PLATFORM_LIBS OpenSSL::Crypto)
         else()
             message(STATUS "Crypto: OpenSSL not found — fetching from source...")
+            include(FetchContent)
             FetchContent_Declare(
                 openssl_cmake
                 GIT_REPOSITORY https://github.com/janbar/openssl-cmake.git
@@ -96,17 +103,20 @@ elseif(UNIX)
     endif()
 endif()
 
-# ── Third-party: nlohmann/json (header-only, fetched at configure time) ─────────
-include(FetchContent)
-FetchContent_Declare(
-    nlohmann_json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG        v3.11.3
-    GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(nlohmann_json)
+# ── Third-party: nlohmann/json ───────────────────────────────────────────────────
+# Guard so a parent project that already fetched nlohmann_json doesn't re-declare it.
+if(NOT TARGET nlohmann_json::nlohmann_json)
+    include(FetchContent)
+    FetchContent_Declare(
+        nlohmann_json
+        GIT_REPOSITORY https://github.com/nlohmann/json.git
+        GIT_TAG        v3.11.3
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(nlohmann_json)
+endif()
 
-# ── DLL target ──────────────────────────────────────────────────────────────────
+# ── Library target ───────────────────────────────────────────────────────────────
 add_library(cppdvr SHARED
     ${PLATFORM_SOURCES}
     src/cppdvr_api.cpp
@@ -116,10 +126,15 @@ add_library(cppdvr SHARED
     src/video_recorder.cpp
 )
 
+# Namespaced alias — parent projects use: target_link_libraries(myapp PRIVATE cppdvr::cppdvr)
+add_library(cppdvr::cppdvr ALIAS cppdvr)
+
 target_include_directories(cppdvr
-    PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/platform
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/platform
 )
 
 target_link_libraries(cppdvr PRIVATE
@@ -135,20 +150,52 @@ set_target_properties(cppdvr PROPERTIES
     DEBUG_POSTFIX "d"
 )
 
-# ── Install rules ───────────────────────────────────────────────────────────────
-install(TARGETS cppdvr
-    RUNTIME DESTINATION bin   # .dll
-    ARCHIVE DESTINATION lib   # .lib import library
-)
-install(DIRECTORY include/ DESTINATION include)
+# ── Install + CMake package export ───────────────────────────────────────────────
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
-# ── Diagnostic demo executable (built by default) ───────────────────────────────
-option(CPPDVR_BUILD_DEMO "Build diagnostic demo executable" ON)
+install(TARGETS cppdvr
+    EXPORT      cppdvrTargets
+    RUNTIME     DESTINATION ${CMAKE_INSTALL_BINDIR}       # .dll
+    LIBRARY     DESTINATION ${CMAKE_INSTALL_LIBDIR}       # .so
+    ARCHIVE     DESTINATION ${CMAKE_INSTALL_LIBDIR}       # .lib / .a
+)
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(EXPORT cppdvrTargets
+    FILE        cppdvrTargets.cmake
+    NAMESPACE   cppdvr::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cppdvr
+)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/cppdvrConfigVersion.cmake"
+    VERSION     ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/cppdvrConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/cppdvrConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cppdvr
+)
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/cppdvrConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/cppdvrConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cppdvr
+)
+
+# ── Demo executables ─────────────────────────────────────────────────────────────
+# Default ON when building standalone, OFF when included as a submodule.
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    option(CPPDVR_BUILD_DEMO "Build diagnostic demo executables" ON)
+else()
+    option(CPPDVR_BUILD_DEMO "Build diagnostic demo executables" OFF)
+endif()
+
 if(CPPDVR_BUILD_DEMO)
     add_executable(cppdvr_demo demo/main.cpp)
     target_link_libraries(cppdvr_demo PRIVATE cppdvr)
     target_include_directories(cppdvr_demo PRIVATE include)
-    # Copy the DLL next to the demo exe after build
     add_custom_command(TARGET cppdvr_demo POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:cppdvr>
@@ -164,7 +211,6 @@ if(CPPDVR_BUILD_DEMO)
             $<TARGET_FILE_DIR:cppdvr_test_frame>
     )
 
-    # Recorder MP4 integration test (records from a live DVR stream)
     add_executable(test_rec_mp4 demo/test_rec_mp4.c)
     target_link_libraries(test_rec_mp4 PRIVATE cppdvr)
     target_include_directories(test_rec_mp4 PRIVATE include)

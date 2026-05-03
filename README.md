@@ -14,27 +14,29 @@ C++ client library for XiongMai DVR cameras using the DVRIP protocol. Builds as 
 ## Repository Layout
 
 ```
-include/            Public headers (C++ and C API)
-  cppdvr_api.h      Pure-C export API
-  dvrip.h           DVRIPCam C++ class
-  stream_server.h   StreamServer C++ class
-  video_recorder.h  VideoRecorder C++ class
-  udp_stream_server.h
+include/              Public headers (C++ and C API)
+  cppdvr_api.h        Pure-C export API
+  dvrip.h             DVRIPCam C++ class
+  stream_server.h     StreamServer C++ class
+  video_recorder.h    VideoRecorder C++ class
+  udp_stream_server.h UdpStreamServer C++ class
 src/
-  cppdvr_api.cpp    C API wrappers (cross-platform)
+  cppdvr_api.cpp      C API wrappers (cross-platform)
   dvrip.cpp
   stream_server.cpp
   video_recorder.cpp
   udp_stream_server.cpp
-  dllmain.cpp       Windows DLL entry point only
+  dllmain.cpp         Windows DLL entry point only
   platform/
     platform_net.h / platform_process.h / platform_crypto.h
-    windows/        Winsock2 + CryptoAPI + CreateProcess implementations
-    posix/          BSD sockets + MD5 + fork/exec implementations
+    windows/          Winsock2 + CryptoAPI + CreateProcess implementations
+    posix/            BSD sockets + MD5 + fork/exec implementations
+cmake/
+  cppdvrConfig.cmake.in   CMake package config template
 demo/
-  main.cpp          DVR → ffmpeg → JPEG → UDP stream diagnostic tool
-  test_frame.cpp    Capture one JPEG frame and save to disk
-  test_rec_mp4.c    Integration test: record a short MP4 from a live stream
+  main.cpp            DVR → ffmpeg → JPEG → UDP stream diagnostic tool
+  test_frame.cpp      Capture one JPEG frame and save to disk
+  test_rec_mp4.c      Integration test: record a short MP4 from a live stream
 CMakeLists.txt
 ```
 
@@ -192,6 +194,37 @@ recorder_destroy(rec);
 ```
 
 See [`include/cppdvr_api.h`](include/cppdvr_api.h) for the full API reference.
+
+## Using as a Submodule
+
+Add cppdvr to your project's `3rdparty/` folder:
+
+```bash
+git submodule add https://your-repo-url/cppdvr.git 3rdparty/cppdvr
+git submodule update --init --recursive
+```
+
+Then in your `CMakeLists.txt`:
+
+```cmake
+add_subdirectory(3rdparty/cppdvr)
+target_link_libraries(myapp PRIVATE cppdvr::cppdvr)
+```
+
+Demo executables are **not** built when included this way (they default to `OFF` when cppdvr is not the top-level project). To force them on: `-DCPPDVR_BUILD_DEMO=ON`.
+
+If your project already uses `nlohmann/json`, cppdvr will detect the existing `nlohmann_json::nlohmann_json` target and skip its own fetch.
+
+### After Installation (find_package)
+
+```bash
+cmake --install build --prefix /usr/local
+```
+
+```cmake
+find_package(cppdvr REQUIRED)
+target_link_libraries(myapp PRIVATE cppdvr::cppdvr)
+```
 
 ## Notes
 
