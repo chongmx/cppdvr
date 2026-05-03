@@ -68,13 +68,17 @@ static long long ms_now() {
 
 static std::mutex g_print_mtx;
 
+static void print(const char* msg) {
+    std::lock_guard<std::mutex> lk(g_print_mtx);
+    std::printf("[%6lld ms] %s\n", ms_now(), msg);
+    std::fflush(stdout);
+}
+
 template<typename... Args>
 static void print(const char* fmt, Args... args) {
     char buf[512];
     std::snprintf(buf, sizeof(buf), fmt, args...);
-    std::lock_guard<std::mutex> lk(g_print_mtx);
-    std::printf("[%6lld ms] %s\n", ms_now(), buf);
-    std::fflush(stdout);
+    print(buf);
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
