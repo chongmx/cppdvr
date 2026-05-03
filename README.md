@@ -1,123 +1,200 @@
 # cppdvr
 
-`cppdvr` is a Windows-focused DVR client library and diagnostic toolkit for XiongMai DVR cameras using the DVRIP protocol.
-
-The repository builds:
-- `cppdvr.dll` — a shared library exposing both C++ and C APIs for DVR access.
-- `cppdvr_demo.exe` — a diagnostic demo that connects to a DVR, receives live frames, and prints frame metadata.
+C++ client library for XiongMai DVR cameras using the DVRIP protocol. Builds as a shared library (`cppdvr.dll` on Windows, `libcppdvr.so` on Linux) with both C++ and pure-C APIs.
 
 ## Features
 
-- Native Windows C++ DVRIP camera client
-- `DVRIPCam` C++ wrapper with:
-  - login/connect/keep-alive
-  - live monitor callback for H264/H265 frames
-  - snapshot capture
-  - PTZ control
-  - raw command send/get support
-- Plain C export API in `include/cppdvr_api.h`
-- Optional stream server support for DVR → ffmpeg → HTTP MJPEG
+- **DVR camera client** — login, keep-alive, live H264/H265 monitor, JPEG snapshot, PTZ control
+- **Stream server** — DVR → ffmpeg → real JPEG frames → HTTP MJPEG endpoint (browser-viewable)
+- **Video recorder** — record to MP4 (lossless passthrough) or MJPEG AVI via ffmpeg
+- **UDP stream server** — send JPEG frames to a Meta Quest headset; receive controller input (XiongMai XRRO v1 protocol)
+- **Pure-C export API** (`include/cppdvr_api.h`) — callable from C, Python ctypes, P/Invoke, Unity, etc.
+- **Cross-platform** — Windows (`.dll`) and Linux / WSL (`.so`) from the same source tree
 
 ## Repository Layout
 
-- `CMakeLists.txt` — build configuration
-- `src/` — library source files
-- `include/` — public headers
-- `demo/main.cpp` — diagnostic demo executable
-- `build/` — generated Visual Studio / CMake build artifacts
+```
+include/            Public headers (C++ and C API)
+  cppdvr_api.h      Pure-C export API
+  dvrip.h           DVRIPCam C++ class
+  stream_server.h   StreamServer C++ class
+  video_recorder.h  VideoRecorder C++ class
+  udp_stream_server.h
+src/
+  cppdvr_api.cpp    C API wrappers (cross-platform)
+  dvrip.cpp
+  stream_server.cpp
+  video_recorder.cpp
+  udp_stream_server.cpp
+  dllmain.cpp       Windows DLL entry point only
+  platform/
+    platform_net.h / platform_process.h / platform_crypto.h
+    windows/        Winsock2 + CryptoAPI + CreateProcess implementations
+    posix/          BSD sockets + MD5 + fork/exec implementations
+demo/
+  main.cpp          DVR → ffmpeg → JPEG → UDP stream diagnostic tool
+  test_frame.cpp    Capture one JPEG frame and save to disk
+  test_rec_mp4.c    Integration test: record a short MP4 from a live stream
+CMakeLists.txt
+```
 
 ## Build Requirements
 
-- Windows
-- CMake 3.20 or newer
-- Visual Studio with C++ support
-- Git (for fetching `nlohmann/json` during configure)
-- Optional: `ffmpeg` available on `PATH` if you use streaming server functionality
+**All platforms**
+- CMake 3.20+
+- C++17 compiler
+- Git (fetches `nlohmann/json` at configure time)
+- `ffmpeg` on `PATH` at runtime (for streaming and recording features)
 
-## Build Instructions
+**Windows**
+- MinGW-w64 / w64devkit, or MSVC / Visual Studio
 
-Open a Developer PowerShell for Visual Studio and run:
+**Linux / WSL**
+- GCC or Clang
+- `make` or `ninja`
+- No system libraries required by default (OpenSSL is optional, see below)
 
-```powershell
-cd C:\VS2022\cppdvr
-mkdir build
-cd build
-cmake -G "Visual Studio 17 2022" -A x64 ..
-cmake --build . --config Release
-```
+## Building
 
-The build produces:
-- `build\x64\Release\cppdvr.dll`
-- `build\x64\Release\cppdvr.lib`
-- `build\x64\Release\cppdvr_demo.exe`
-
-## Run the Demo
-
-The demo connects to a DVR and prints incoming frames. Example:
+### Windows (MinGW / w64devkit)
 
 ```powershell
-cd build\x64\Release
-cppdvr_demo.exe 172.20.80.12 admin password Main
+cmake -B build -G "Ninja"
+cmake --build build --parallel
 ```
 
-If you omit arguments, the demo uses defaults from `demo/main.cpp`.
+### Windows (Visual Studio)
+
+```powershell
+cmake -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+```
+
+### Linux / WSL
+
+```bash
+cmake -B build
+cmake --build build --parallel $(nproc)
+```
+
+Output: `build/libcppdvr.so`, `build/cppdvr_demo`, `build/cppdvr_test_frame`, `build/test_rec_mp4`
+
+## Crypto Backend (Linux only)
+
+MD5 is used for DVRIP authentication. The build selects an implementation automatically; override with `-DCPPDVR_CRYPTO=<value>`:
+
+| Value | Behaviour |
+|---|---|
+| `AUTO` **(default)** | Use system OpenSSL if installed, otherwise fall back to built-in |
+| `BUILTIN` | Always use the self-contained MD5 implementation (no dependencies) |
+| `OPENSSL` | Require system OpenSSL — prints install instructions and stops if missing |
+| `FETCH` | Use system OpenSSL if installed, otherwise clone and build it from source |
+
+Install system OpenSSL if needed:
+```bash
+sudo apt install libssl-dev      # Debian / Ubuntu / WSL
+sudo dnf install openssl-devel   # Fedora / RHEL
+brew install openssl             # macOS
+```
+
+## Running the Demos
+
+### Diagnostic stream demo
+
+Connects to a DVR, starts ffmpeg, streams JPEG frames over UDP, and serves an HTTP MJPEG endpoint.
+
+```bash
+# Windows
+build\cppdvr_demo.exe [host] [user] [password] [stream] [--run]
+
+# Linux
+./build/cppdvr_demo [host] [user] [password] [stream] [--run]
+```
+
+Defaults: host `172.20.80.12`, user `admin`, no password, stream `Main`, 30-second timed run.  
+Add `--run` for continuous streaming (type `q` + Enter to quit).
+
+HTTP debug view: `http://localhost:8080/stream`
+
+### Single-frame capture test
+
+```bash
+./build/cppdvr_test_frame [host] [user] [password] [stream]
+```
+
+Waits up to 15 seconds for the first JPEG frame, saves it to `test_frame.jpg`, and exits 0 on success.
+
+### MP4 recording integration test
+
+```bash
+./build/test_rec_mp4 [host] [user] [password] [stream] [output.mp4]
+```
+
+Records a short clip, verifies the file was written, and prints a pass/fail result.
 
 ## Library Usage
 
 ### C++ API
 
-Include headers and link `cppdvr.lib`:
-
 ```cpp
 #include "dvrip.h"
+#include "stream_server.h"
 
-int main() {
-    cppdvr::DVRIPCam cam("192.168.1.100", "admin", "password");
-    if (!cam.login()) {
-        std::cerr << cam.last_error() << std::endl;
-        return 1;
-    }
+// DVR camera
+cppdvr::DVRIPCam cam("192.168.1.100", "admin", "password");
+cam.login();
+cam.start_monitor([](const uint8_t* data, size_t size, const cppdvr::FrameMeta& m) {
+    // raw H264/H265 NAL bytes
+}, "Main");
+cam.stop_monitor();
 
-    cam.set_log_callback([](const char* msg){
-        std::cout << "DVR LOG: " << msg << std::endl;
-    });
+// Stream server (DVR → ffmpeg → JPEG)
+cppdvr::StreamServerConfig cfg;
+cfg.dvr_host = "192.168.1.100";
+cfg.dvr_user = "admin";
+cfg.http_port = 8080;
 
-    cam.start_monitor([](const uint8_t* data, size_t size, const cppdvr::FrameMeta& meta){
-        std::cout << "frame=" << meta.frame << " type=" << meta.type << " size=" << size << std::endl;
-    });
-    // ...
-    cam.stop_monitor();
-    return 0;
-}
+cppdvr::StreamServer srv(cfg);
+srv.set_jpeg_callback([](const uint8_t* jpeg, size_t size) {
+    // real JPEG bytes, FF D8 ... FF D9
+});
+srv.start();
 ```
 
 ### C API
 
-Use `include/cppdvr_api.h` and call the exported functions from C or other languages that can load a Windows DLL.
-
 ```c
 #include "cppdvr_api.h"
 
-int main() {
-    DVRHandle h = dvr_create("192.168.1.100", 34567, "admin", "password");
-    if (!dvr_login(h)) {
-        // handle error
-    }
-    // ...
-    dvr_destroy(h);
-    return 0;
-}
+// DVR
+DVRHandle cam = dvr_create("192.168.1.100", 0, "admin", "");
+dvr_login(cam);
+dvr_start_monitor(cam, my_frame_cb, NULL, "Main");
+dvr_stop_monitor(cam);
+dvr_destroy(cam);
+
+// Stream server
+StreamHandle srv = stream_create("192.168.1.100", 0, "admin", "", 8080);
+stream_set_jpeg_callback(srv, my_jpeg_cb, NULL);
+stream_start(srv, "Main");
+// ...
+stream_stop(srv);
+stream_destroy(srv);
+
+// Recorder
+RecorderHandle rec = recorder_create();
+recorder_init_with_stream(rec, srv);
+recorder_start(rec, "output.mp4", RECORDER_FORMAT_MP4, 0);
+// ... stream runs, frames are recorded automatically ...
+recorder_save(rec);
+recorder_deinit(rec);
+recorder_destroy(rec);
 ```
 
-### Stream Server
-
-The library also includes stream server support for DVR → ffmpeg → HTTP MJPEG streaming. Use `StreamServer` from `stream_server.h` to start an HTTP endpoint.
+See [`include/cppdvr_api.h`](include/cppdvr_api.h) for the full API reference.
 
 ## Notes
 
-- The project is targeted at Windows and uses WinSock2 plus Windows CryptoAPI.
-- The C API uses UTF-8 null-terminated strings and opaque handles.
-
-## Contributing
-
-Contributions, issues, and pull requests are welcome. For build issues, verify that Visual Studio and CMake are installed correctly, and that `ffmpeg` is on `PATH` if needed.
+- `ffmpeg` must be on `PATH` at runtime for `StreamServer` and `VideoRecorder` to function.
+- The C API uses UTF-8 null-terminated strings and opaque handles. Every `*_create()` must be matched with a `*_destroy()`.
+- On Windows, Winsock2 initialisation is handled internally — callers do not need to call `WSAStartup`.
