@@ -52,3 +52,5 @@ Makefile
 
 # ── Claude Code internal ───────────────────────────────────────────────────────
 .claude/
+build/
+python-dvr-master/
