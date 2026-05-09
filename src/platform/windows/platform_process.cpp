@@ -146,19 +146,51 @@ PlatformProcess platform_spawn_process(const std::string& executable,
     }
     std::wstring wcmd = string_to_wstring(cmd);
 
-    STARTUPINFOW si;
+    // Use PROC_THREAD_ATTRIBUTE_HANDLE_LIST so only the three child-side pipe
+    // handles are inherited.  Without this, every inheritable handle in the
+    // parent process (including pipes from other concurrently-spawned ffmpeg
+    // instances) would be inherited, keeping extra write-ends alive and causing
+    // ReadFile on stderr to never return EOF after the child exits.
+    HANDLE inheritHandles[3] = { hStdinRead, hStdoutWrite, hStderrWrite };
+
+    SIZE_T attrListSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attrListSize);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrList =
+        static_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
+            HeapAlloc(GetProcessHeap(), 0, attrListSize));
+    if (!attrList ||
+        !InitializeProcThreadAttributeList(attrList, 1, 0, &attrListSize) ||
+        !UpdateProcThreadAttribute(attrList, 0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            inheritHandles, sizeof(inheritHandles), nullptr, nullptr))
+    {
+        if (attrList) HeapFree(GetProcessHeap(), 0, attrList);
+        CloseHandle(hStdinRead);  CloseHandle(hStdinWrite);
+        CloseHandle(hStdoutRead); CloseHandle(hStdoutWrite);
+        CloseHandle(hStderrRead); CloseHandle(hStderrWrite);
+        return INVALID_PROCESS;
+    }
+
+    STARTUPINFOEXW si;
     ZeroMemory(&si, sizeof(si));
-    si.cb          = sizeof(si);
-    si.hStdInput   = hStdinRead;
-    si.hStdOutput  = hStdoutWrite;
-    si.hStdError   = hStderrWrite;
-    si.dwFlags     = STARTF_USESTDHANDLES;
+    si.StartupInfo.cb        = sizeof(STARTUPINFOEXW);
+    si.StartupInfo.hStdInput  = hStdinRead;
+    si.StartupInfo.hStdOutput = hStdoutWrite;
+    si.StartupInfo.hStdError  = hStderrWrite;
+    si.StartupInfo.dwFlags    = STARTF_USESTDHANDLES;
+    si.lpAttributeList        = attrList;
 
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
 
     BOOL ok = CreateProcessW(NULL, (LPWSTR)wcmd.c_str(), NULL, NULL,
-                             TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+                             TRUE,
+                             CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                             NULL, NULL,
+                             reinterpret_cast<LPSTARTUPINFOW>(&si), &pi);
+
+    DeleteProcThreadAttributeList(attrList);
+    HeapFree(GetProcessHeap(), 0, attrList);
 
     // Close child-side handles in parent regardless of outcome
     CloseHandle(hStdinRead);

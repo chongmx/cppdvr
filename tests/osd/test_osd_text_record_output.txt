@@ -1,0 +1,47 @@
+﻿=== OSD Text Record Test ===
+       Host: 172.20.80.12  User: admin  Output: osd_text_record.mp4  Duration: 5 s
+[PASS] Login OK
+[PASS] OSD text set: 'HELLO CPPDVR'
+[PASS] stream_create + recorder_create OK
+       [rec] recorder: start_recording  format=mp4  fps=25
+       [rec] recorder: -> osd_text_record.mp4
+[PASS] recorder_start OK
+[PASS] stream_start OK
+       Recording 'HELLO CPPDVR' overlay for 5 s ...
+       ffmpeg: waiting for first I-frame from DVR...
+       DVR: outbound local IP = 172.20.80.100 (binding socket)
+       DVR: connecting to 172.20.80.12:34567 ...
+       HTTP: listening on port 8080  →  http://localhost:8080/stream
+       DVR: login OK  session=0x0000001D  stream=Main
+       DVR: OPMonitor Claim OK (Ret=100)
+       DVR: OPMonitor Start sent — receiving frames ...
+       DVR: first frame received  type=h264 frame=I  832x1616 @ 25 fps
+       [rec] recorder: starting ffmpeg  format=mp4  codec=h265  crf=18  copy=1
+       [rec] recorder: -> osd_text_record.mp4
+       [rec] recorder: output -> C:\VS2022\cppdvr\build\tests\Release\osd_text_record.mp4
+       [rec] recorder: cmd: ffmpeg -loglevel warning -f hevc -i pipe:0 -c:v copy -y osd_text_record.mp4
+       ffmpeg: codec=h265  832x1616 @ 25 fps  first-bytes: 00000001
+       ffmpeg: launching  codec=h265  q=5  scale=native
+       [t+1s]  frames=0  dropped=0
+       ffmpeg: running — decoding to MJPEG
+       [rec] recorder: 25 frames written so far
+       [t+2s]  frames=45  dropped=0
+       [rec] ffmpeg: [mp4 @ 00000205c125d980] Timestamps are unset in a packet for stream 0. This is deprecated and will stop working in the future. Fix your code to set the timestamps properly
+       ffmpeg: first JPEG frame ready — streaming
+       [t+3s]  frames=70  dropped=0
+       [t+4s]  frames=95  dropped=0
+       DVR: measured FPS = 25.10  (100 frames in 3.944 s, total=100)
+       [rec] recorder: 100 frames written so far
+       [t+5s]  frames=120  dropped=0
+[PASS] 120 frames written
+       [rec] recorder: finalizing  (120 frames written)...
+       [rec] recorder: saved -> osd_text_record.mp4
+[PASS] recorder_save completed
+       ffmpeg: pipeline stopped — restarting in 3 s
+       DVR: monitor stopped — reconnecting in 5 s
+[PASS] stream_stop completed
+       Output: osd_text_record.mp4  size: 731286 bytes (714.1 KB)
+[PASS] MP4 file exists and is reasonably sized
+[PASS] Channel title cleared
+
+=== Results: 10 passed, 0 failed ===

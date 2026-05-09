@@ -192,6 +192,17 @@ else()
     option(CPPDVR_BUILD_DEMO "Build diagnostic demo executables" OFF)
 endif()
 
+# ── Integration test executables ─────────────────────────────────────────────────
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    option(CPPDVR_BUILD_TESTS "Build DVR integration test executables" ON)
+else()
+    option(CPPDVR_BUILD_TESTS "Build DVR integration test executables" OFF)
+endif()
+
+if(CPPDVR_BUILD_TESTS)
+    add_subdirectory(tests)
+endif()
+
 if(CPPDVR_BUILD_DEMO)
     add_executable(cppdvr_demo demo/main.cpp)
     target_link_libraries(cppdvr_demo PRIVATE cppdvr)

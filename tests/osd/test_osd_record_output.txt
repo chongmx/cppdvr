@@ -1,0 +1,141 @@
+﻿=== OSD Overlay + Recording Test ===
+       Host: 172.20.80.12  User: admin  Output: osd_overlay_test.mp4  Duration: 8 s
+
+--- Login ---
+[PASS] Login OK
+
+--- Set channel title overlay ---
+[PASS] Channel title set to 'OSD TEST ACTIVE'
+
+--- Create stream server and recorder ---
+[PASS] stream_create + recorder_create OK
+[PASS] recorder_init_with_stream OK
+
+--- Start recording ---
+       [rec] recorder: start_recording  format=mp4  fps=25
+       [rec] recorder: -> osd_overlay_test.mp4
+[PASS] recorder_start OK
+
+--- Start DVR stream ---
+[PASS] stream_start OK
+
+--- Recording with OSD overlay active ---
+       Streaming with 'OSD TEST ACTIVE' title for 8 s ...
+       DVR: outbound local IP = 172.20.80.100 (binding socket)
+       DVR: connecting to 172.20.80.12:34567 ...
+       ffmpeg: waiting for first I-frame from DVR...
+       HTTP: listening on port 8080  →  http://localhost:8080/stream
+       DVR: login OK  session=0x0000001B  stream=Main
+       DVR: OPMonitor Claim OK (Ret=100)
+       DVR: OPMonitor Start sent — receiving frames ...
+       DVR: first frame received  type=h264 frame=I  832x1616 @ 25 fps
+       [rec] recorder: starting ffmpeg  format=mp4  codec=h265  crf=18  copy=1
+       [rec] recorder: -> osd_overlay_test.mp4
+       [rec] recorder: output -> C:\VS2022\cppdvr\build\tests\Release\osd_overlay_test.mp4
+       [rec] recorder: cmd: ffmpeg -loglevel warning -f hevc -i pipe:0 -c:v copy -y osd_overlay_test.mp4
+       ffmpeg: codec=h265  832x1616 @ 25 fps  first-bytes: 00000001
+       ffmpeg: launching  codec=h265  q=5  scale=native
+       ffmpeg: running — decoding to MJPEG
+       [t+1s]  frames written=23  dropped=0
+       [rec] recorder: 25 frames written so far
+       [t+2s]  frames written=48  dropped=0
+       [rec] ffmpeg: [mp4 @ 000001e29e5ad8c0] Timestamps are unset in a packet for stream 0. This is deprecated and will stop working in the future. Fix your code to set the timestamps properly
+       ffmpeg: first JPEG frame ready — streaming
+       [t+3s]  frames written=73  dropped=0
+       [t+4s]  frames written=98  dropped=0
+       DVR: measured FPS = 25.11  (100 frames in 3.942 s, total=100)
+       [rec] recorder: 100 frames written so far
+       [t+5s]  frames written=123  dropped=0
+       [t+6s]  frames written=148  dropped=0
+       [t+7s]  frames written=173  dropped=0
+       [t+8s]  frames written=199  dropped=0
+[PASS] 199 frames written to MP4
+
+--- Save and stop ---
+       Finalising MP4 (waiting for ffmpeg muxer) ...
+       [rec] recorder: finalizing  (199 frames written)...
+       [rec] recorder: saved -> osd_overlay_test.mp4
+[PASS] recorder_save completed
+       DVR: measured FPS = 24.72  (100 frames in 4.005 s, total=200)
+       ffmpeg: pipeline stopped — restarting in 3 s
+       DVR: monitor stopped — reconnecting in 5 s
+[PASS] stream_stop completed
+
+--- Restore channel title ---
+[PASS] Channel title cleared
+
+--- Verify output file ---
+       File: osd_overlay_test.mp4  size: 993010 bytes (969.7 KB)
+[PASS] Output file exists and is reasonably sized
+
+--- ffprobe metadata ---
+       [cmd] ffprobe -v quiet -show_streams -print_format flat "osd_overlay_test.mp4"
+       streams.stream.0.index=0
+       streams.stream.0.codec_name="hevc"
+       streams.stream.0.codec_long_name="H.265 / HEVC (High Efficiency Video Coding)"
+       streams.stream.0.profile="Main"
+       streams.stream.0.codec_type="video"
+       streams.stream.0.codec_tag_string="hev1"
+       streams.stream.0.codec_tag="0x31766568"
+       streams.stream.0.width=2880
+       streams.stream.0.height=1616
+       streams.stream.0.coded_width=2880
+       streams.stream.0.coded_height=1616
+       streams.stream.0.closed_captions=0
+       streams.stream.0.film_grain=0
+       streams.stream.0.has_b_frames=0
+       streams.stream.0.sample_aspect_ratio="N/A"
+       streams.stream.0.display_aspect_ratio="N/A"
+       streams.stream.0.pix_fmt="yuvj420p"
+       streams.stream.0.level=150
+       streams.stream.0.color_range="pc"
+       streams.stream.0.color_space="unknown"
+       streams.stream.0.color_transfer="unknown"
+       streams.stream.0.color_primaries="unknown"
+       streams.stream.0.chroma_location="left"
+       streams.stream.0.field_order="unknown"
+       streams.stream.0.refs=1
+       streams.stream.0.id="0x1"
+       streams.stream.0.r_frame_rate="25/1"
+       streams.stream.0.avg_frame_rate="25/1"
+       streams.stream.0.time_base="1/1200000"
+       streams.stream.0.start_pts=0
+       streams.stream.0.start_time="0.000000"
+       streams.stream.0.duration_ts=9552000
+       streams.stream.0.duration="7.960000"
+       streams.stream.0.bit_rate="996274"
+       streams.stream.0.max_bit_rate="N/A"
+       streams.stream.0.bits_per_raw_sample="N/A"
+       streams.stream.0.nb_frames="199"
+       streams.stream.0.nb_read_frames="N/A"
+       streams.stream.0.nb_read_packets="N/A"
+       streams.stream.0.extradata_size=117
+       streams.stream.0.disposition.default=1
+       streams.stream.0.disposition.dub=0
+       streams.stream.0.disposition.original=0
+       streams.stream.0.disposition.comment=0
+       streams.stream.0.disposition.lyrics=0
+       streams.stream.0.disposition.karaoke=0
+       streams.stream.0.disposition.forced=0
+       streams.stream.0.disposition.hearing_impaired=0
+       streams.stream.0.disposition.visual_impaired=0
+       streams.stream.0.disposition.clean_effects=0
+       streams.stream.0.disposition.attached_pic=0
+       streams.stream.0.disposition.timed_thumbnails=0
+       streams.stream.0.disposition.non_diegetic=0
+       streams.stream.0.disposition.captions=0
+       streams.stream.0.disposition.descriptions=0
+       streams.stream.0.disposition.metadata=0
+       streams.stream.0.disposition.dependent=0
+       streams.stream.0.disposition.still_image=0
+       streams.stream.0.tags.language="und"
+       streams.stream.0.tags.handler_name="VideoHandler"
+       streams.stream.0.tags.vendor_id="[0][0][0][0]"
+[PASS] ffprobe metadata OK
+
+--- Extract first frame from MP4 ---
+       [cmd] ffmpeg -loglevel error -i "osd_overlay_test.mp4" -frames:v 1 -y "osd_overlay_frame0.jpg"
+       Frame JPEG magic: FF D8  size: 197235 bytes
+[PASS] Extracted frame is a valid JPEG (FF D8)
+
+=== Results: 13 passed, 0 failed ===

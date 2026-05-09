@@ -89,6 +89,107 @@ CPPDVR_API int dvr_ptz(DVRHandle   h,
                        int         preset,
                        int         channel);
 
+// ── Time ───────────────────────────────────────────────────────────────────────
+// Returns non-zero on success.
+CPPDVR_API int dvr_get_time(DVRHandle h,
+                             int* year, int* month, int* day,
+                             int* hour, int* minute, int* second);
+CPPDVR_API int dvr_set_time(DVRHandle h,
+                             int year, int month, int day,
+                             int hour, int minute, int second);
+
+// ── Reboot ─────────────────────────────────────────────────────────────────────
+CPPDVR_API int dvr_reboot(DVRHandle h);
+
+// ── OSD / Text overlay ─────────────────────────────────────────────────────────
+// titles[0..count-1] are UTF-8 channel label strings.
+CPPDVR_API int dvr_set_channel_titles(DVRHandle h,
+                                       const char** titles, int count);
+// bitmap_data: packed 1-bpp pixels, row-major, ceil(width/8)*height bytes.
+CPPDVR_API int dvr_set_channel_bitmap(DVRHandle h,
+                                       int width, int height,
+                                       const uint8_t* bitmap_data,
+                                       size_t bitmap_size);
+
+// ── Network settings ───────────────────────────────────────────────────────────
+typedef struct {
+    char ip[64];
+    char mask[64];
+    char gateway[64];
+    char dns[64];
+    char hostname[128];
+    char mac[32];
+    int  tcp_port;
+    int  http_port;
+    int  dhcp;   // 0 = static, 1 = DHCP
+} DVRNetworkInfoC;
+CPPDVR_API int dvr_get_network_info(DVRHandle h, DVRNetworkInfoC* out);
+CPPDVR_API int dvr_set_network_info(DVRHandle h, const DVRNetworkInfoC* info);
+
+// ── Generic config get/set ─────────────────────────────────────────────────────
+// dvr_get_info returns a heap-allocated JSON string; caller must dvr_free_string().
+// Returns NULL on failure.
+CPPDVR_API char* dvr_get_info(DVRHandle h, const char* name);
+CPPDVR_API int   dvr_set_info(DVRHandle h, const char* name, const char* json);
+CPPDVR_API void  dvr_free_string(char* s);
+
+// ── Device discovery ───────────────────────────────────────────────────────────
+// UDP broadcast on port 34569.  Does not require a connected DVRHandle.
+// On success returns non-zero and sets *out_arr / *out_count.
+// Caller must free with dvr_free_discovered().
+typedef struct {
+    char ip[64];
+    char mac[32];
+    char hostname[128];
+    char sn[64];
+    int  tcp_port;
+    int  http_port;
+} DVRDiscoveredDeviceC;
+CPPDVR_API int  dvr_discover(int timeout_ms,
+                               DVRDiscoveredDeviceC** out_arr,
+                               int*                   out_count);
+CPPDVR_API void dvr_free_discovered(DVRDiscoveredDeviceC* arr);
+
+// ── Encoding settings  (Simplify.Encode) ───────────────────────────────────────
+typedef struct {
+    char compression[32];   // "H.264", "H.265", "MPEG4"
+    char resolution[32];    // "5M","4M","3M","1080P","720P","D1","HD1","CIF"
+    char bitrate_ctrl[8];   // "VBR" or "CBR"
+    int  bitrate;           // kbps
+    int  fps;
+    int  gop;               // keyframe interval in seconds
+    int  quality;           // 1–6
+    int  video_enable;
+    int  audio_enable;
+} DVRVideoStreamFormatC;
+
+typedef struct {
+    DVRVideoStreamFormatC main;
+    DVRVideoStreamFormatC extra;
+} DVREncodeConfigC;
+
+// channel=0 for single-channel cameras.
+CPPDVR_API int dvr_get_encode_config(DVRHandle h, DVREncodeConfigC* out, int channel);
+CPPDVR_API int dvr_set_encode_config(DVRHandle h, const DVREncodeConfigC* cfg, int channel);
+
+// ── Camera / video-color parameters  (AVEnc.VideoColor) ────────────────────────
+typedef struct {
+    int brightness;    // 0–100
+    int contrast;      // 0–100
+    int saturation;    // 0–100
+    int hue;           // 0–100
+    int sharpness;     // Acutance — camera-specific range
+    int gain;          // 0–100
+    int whitebalance;  // 0–255
+} DVRVideoColorC;
+
+// channel=0, time_section=0 (always-on section).
+CPPDVR_API int dvr_get_video_color(DVRHandle h, DVRVideoColorC* out, int channel);
+CPPDVR_API int dvr_set_video_color(DVRHandle h, const DVRVideoColorC* params, int channel);
+
+// Copy the last error string into out_buf (null-terminated, at most buf_len bytes).
+CPPDVR_API void dvr_last_error(DVRHandle h, char* out_buf, int buf_len);
+
 // ════════════════════════════════════════════════════════════════════════════════
 // Stream Server API  (DVR → ffmpeg → HTTP MJPEG)
 // ════════════════════════════════════════════════════════════════════════════════

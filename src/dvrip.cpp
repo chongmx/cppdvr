@@ -60,9 +60,11 @@ static constexpr uint32_t kFrmJpegSig = 0xFFD8FFE0; // Raw JPEG in payload
 static std::string codec_from_media(uint32_t data_type, uint8_t media_byte) {
     if (data_type == kFrmIFrame || data_type == kFrmPFrame || data_type == kFrmJpeg) {
         switch (media_byte) {
+            case 0: return "h264";   // some cameras use 0 for H264
             case 1: return "mpeg4";
             case 2: return "h264";
             case 3: return "h265";
+            default: return "h264";  // unknown — assume H264 (most common)
         }
     } else if (data_type == kFrmInfo) {
         if (media_byte == 1 || media_byte == 6) return "info";
@@ -258,6 +260,57 @@ struct DVRIPCam::Impl {
             return { {"raw", std::string(payload_buf.begin(),
                                          payload_buf.end())} };
         }
+    }
+
+    // Like send_msg but payload is raw binary bytes rather than JSON.
+    // Used for the bitmap overlay (msg 0x041A).
+    json send_raw_msg(uint16_t msg_id, const std::vector<uint8_t>& payload) {
+        if (sock == INVALID_PLATFORM_SOCKET) return { {"Ret", 101} };
+
+        std::unique_lock<std::mutex> lock(send_mutex);
+
+        uint32_t data_len = static_cast<uint32_t>(payload.size() + 2);
+
+        DVRIPHeader hdr{};
+        hdr.head     = 0xFF;
+        hdr.version  = 0;
+        hdr.session  = session;
+        hdr.sequence = packet_count;
+        hdr.msg_id   = msg_id;
+        hdr.data_len = data_len;
+
+        std::vector<uint8_t> pkt;
+        pkt.reserve(sizeof(hdr) + payload.size() + 2);
+        pkt.insert(pkt.end(),
+                   reinterpret_cast<const uint8_t*>(&hdr),
+                   reinterpret_cast<const uint8_t*>(&hdr) + sizeof(hdr));
+        pkt.insert(pkt.end(), payload.begin(), payload.end());
+        pkt.push_back(0x0a);
+        pkt.push_back(0x00);
+        ++packet_count;
+
+        if (!tcp_send(pkt.data(), pkt.size())) {
+            last_err = "send_raw_msg: send failed";
+            return { {"Ret", 101} };
+        }
+
+        auto hdr_buf = tcp_recv_exact(sizeof(DVRIPHeader));
+        if (hdr_buf.empty()) { last_err = "send_raw_msg: recv header failed"; return {}; }
+
+        DVRIPHeader rhdr;
+        std::memcpy(&rhdr, hdr_buf.data(), sizeof(rhdr));
+        session = rhdr.session;
+
+        if (rhdr.data_len == 0) return json::object();
+
+        auto pbuf = tcp_recv_exact(rhdr.data_len);
+        if (pbuf.empty()) { last_err = "send_raw_msg: recv payload failed"; return {}; }
+
+        size_t jlen = pbuf.size();
+        while (jlen > 0 && (pbuf[jlen-1] == 0x00 || pbuf[jlen-1] == 0x0a)) --jlen;
+
+        try { return json::parse(pbuf.begin(), pbuf.begin() + jlen); }
+        catch (...) { return { {"raw", std::string(pbuf.begin(), pbuf.end())} }; }
     }
 
     // ── Reassemble binary payload (video frames, snapshots) ───────────────────
@@ -765,6 +818,372 @@ void DVRIPCam::set_log_callback(LogFn fn) {
 
 void DVRIPCam::set_bind_ip(const std::string& local_ip) {
     d_->bind_ip = local_ip;
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+static std::string hex_to_ip(const std::string& hex) {
+    if (hex.empty()) return "";
+    try {
+        uint32_t v = static_cast<uint32_t>(std::stoul(hex, nullptr, 16));
+        const auto* b = reinterpret_cast<const uint8_t*>(&v);
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+        return buf;
+    } catch (...) { return hex; }
+}
+
+static std::string ip_to_hex(const std::string& ip) {
+    unsigned int a = 0, b = 0, c = 0, d = 0;
+    if (std::sscanf(ip.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return ip;
+    uint32_t v = a | (b << 8) | (c << 16) | (d << 24);
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "0x%08X", v);
+    return buf;
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Time
+// ════════════════════════════════════════════════════════════════════════════════
+
+bool DVRIPCam::get_time(DeviceTime& out) {
+    char session_str[16];
+    std::snprintf(session_str, sizeof(session_str), "0x%08X", d_->session);
+
+    auto resp = d_->send_msg(1452,
+        { {"Name", "OPTimeQuery"}, {"SessionID", session_str} });
+
+    if (resp.empty()) return false;
+    if (resp.value("Ret", 101) != 100 && resp.value("Ret", 101) != 515) return false;
+
+    std::string ts = resp.value("OPTimeQuery", "");
+    if (ts.empty()) return false;
+
+    return std::sscanf(ts.c_str(), "%d-%d-%d %d:%d:%d",
+                       &out.year, &out.month, &out.day,
+                       &out.hour, &out.minute, &out.second) == 6;
+}
+
+bool DVRIPCam::set_time(const DeviceTime& dt) {
+    char ts[32];
+    std::snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d",
+                  dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second);
+
+    char session_str[16];
+    std::snprintf(session_str, sizeof(session_str), "0x%08X", d_->session);
+
+    auto resp = d_->send_msg(1450,
+        { {"Name", "OPTimeSetting"}, {"SessionID", session_str},
+          {"OPTimeSetting", std::string(ts)} });
+
+    int ret = resp.value("Ret", 101);
+    return (ret == 100 || ret == 515);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// OSD / Text Overlay
+// ════════════════════════════════════════════════════════════════════════════════
+
+bool DVRIPCam::set_channel_titles(const std::vector<std::string>& titles) {
+    char session_str[16];
+    std::snprintf(session_str, sizeof(session_str), "0x%08X", d_->session);
+
+    json titles_json = json::array();
+    for (const auto& t : titles)
+        titles_json.push_back(t);
+
+    auto resp = d_->send_msg(1046,
+        { {"Name", "ChannelTitle"}, {"SessionID", session_str},
+          {"ChannelTitle", titles_json} });
+
+    int ret = resp.value("Ret", 101);
+    return (ret == 100 || ret == 515);
+}
+
+bool DVRIPCam::set_channel_bitmap(int width, int height,
+                                   const std::vector<uint8_t>& bitmap_data) {
+    std::vector<uint8_t> payload(16, 0);
+    payload[0] = static_cast<uint8_t>(width  & 0xFF);
+    payload[1] = static_cast<uint8_t>(width  >> 8);
+    payload[2] = static_cast<uint8_t>(height & 0xFF);
+    payload[3] = static_cast<uint8_t>(height >> 8);
+    payload.insert(payload.end(), bitmap_data.begin(), bitmap_data.end());
+
+    auto resp = d_->send_raw_msg(0x041A, payload);
+    int ret = resp.value("Ret", 101);
+    return (ret == 100 || ret == 515);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Reboot
+// ════════════════════════════════════════════════════════════════════════════════
+
+bool DVRIPCam::reboot() {
+    char session_str[16];
+    std::snprintf(session_str, sizeof(session_str), "0x%08X", d_->session);
+
+    auto resp = d_->send_msg(1450,
+        { {"Name", "OPMachine"}, {"SessionID", session_str},
+          {"OPMachine", { {"Action", "Reboot"} }} });
+
+    int ret = resp.value("Ret", 101);
+    return (ret == 100 || ret == 515);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Generic config get/set
+// ════════════════════════════════════════════════════════════════════════════════
+
+std::string DVRIPCam::get_info(const std::string& name) {
+    char session_str[16];
+    std::snprintf(session_str, sizeof(session_str), "0x%08X", d_->session);
+
+    auto resp = d_->send_msg(1042,
+        { {"Name", name}, {"SessionID", session_str} });
+
+    if (resp.empty()) return "{}";
+    if (resp.contains(name))
+        return resp[name].dump();
+    return resp.dump();
+}
+
+bool DVRIPCam::set_info(const std::string& name, const std::string& data_json) {
+    json data = json::parse(data_json, nullptr, false);
+    if (data.is_discarded()) data = json::object();
+
+    char session_str[16];
+    std::snprintf(session_str, sizeof(session_str), "0x%08X", d_->session);
+
+    auto resp = d_->send_msg(1040,
+        { {"Name", name}, {"SessionID", session_str}, {name, data} });
+
+    int ret = resp.value("Ret", 101);
+    return (ret == 100 || ret == 515);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Network settings
+// ════════════════════════════════════════════════════════════════════════════════
+
+bool DVRIPCam::get_network_info(NetworkInfo& out) {
+    std::string raw = get_info("NetWork.NetCommon");
+    json j = json::parse(raw, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return false;
+
+    out.ip        = hex_to_ip(j.value("HostIP",   ""));
+    out.mask      = hex_to_ip(j.value("Submask",  ""));
+    out.gateway   = hex_to_ip(j.value("GateWay",  ""));
+    out.dns       = hex_to_ip(j.value("DNS",       ""));
+    out.hostname  = j.value("HostName", "");
+    out.mac       = j.value("MAC",      "");
+    out.tcp_port  = j.value("TCPPort",  34567);
+    out.http_port = j.value("HttpPort", 80);
+    out.dhcp      = j.value("DHCP", false);
+    return true;
+}
+
+bool DVRIPCam::set_network_info(const NetworkInfo& info) {
+    std::string raw = get_info("NetWork.NetCommon");
+    json cfg = json::parse(raw, nullptr, false);
+    if (cfg.is_discarded()) cfg = json::object();
+
+    if (!info.ip.empty())       cfg["HostIP"]   = ip_to_hex(info.ip);
+    if (!info.mask.empty())     cfg["Submask"]  = ip_to_hex(info.mask);
+    if (!info.gateway.empty())  cfg["GateWay"]  = ip_to_hex(info.gateway);
+    if (!info.dns.empty())      cfg["DNS"]      = ip_to_hex(info.dns);
+    if (!info.hostname.empty()) cfg["HostName"] = info.hostname;
+    if (info.tcp_port  > 0)     cfg["TCPPort"]  = info.tcp_port;
+    if (info.http_port > 0)     cfg["HttpPort"] = info.http_port;
+    cfg["DHCP"] = info.dhcp;
+
+    return set_info("NetWork.NetCommon", cfg.dump());
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Device discovery
+// ════════════════════════════════════════════════════════════════════════════════
+
+std::vector<DVRIPCam::DiscoveredDevice> DVRIPCam::discover(int timeout_ms,
+                                                            const std::string& bind_ip) {
+    platform_net_init();
+
+    PlatformSocket sock = platform_udp_socket();
+    if (sock == INVALID_PLATFORM_SOCKET)
+        return {};
+
+    platform_set_reuseaddr(sock);
+
+    const std::string bind_addr = bind_ip.empty() ? "0.0.0.0" : bind_ip;
+    platform_bind(sock, bind_addr, 34569);
+
+    uint8_t pkt[20] = {};
+    pkt[0]  = 0xFF;
+    pkt[14] = 0xFA;
+    pkt[15] = 0x05;
+
+    {
+        int bcast = 1;
+        platform_setsockopt(sock, "SO_BROADCAST", &bcast, sizeof(bcast));
+    }
+
+    platform_sendto(sock, "255.255.255.255", 34569, pkt, sizeof(pkt));
+
+    std::vector<DiscoveredDevice> result;
+    auto deadline = std::chrono::steady_clock::now()
+                  + std::chrono::milliseconds(timeout_ms);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        int remaining_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count());
+        if (remaining_ms <= 0) break;
+
+        uint8_t buf[2048] = {};
+        std::string src_ip;
+        uint16_t    src_port = 0;
+        int n = platform_recvfrom(sock, buf, static_cast<int>(sizeof(buf)),
+                                  remaining_ms, src_ip, src_port);
+        if (n < 20) continue;
+
+        DVRIPHeader rhdr;
+        std::memcpy(&rhdr, buf, sizeof(rhdr));
+        if (rhdr.head != 0xFF) continue;
+        if (rhdr.msg_id != 1531) continue;
+        if (rhdr.data_len == 0) continue;
+        if (static_cast<int>(sizeof(DVRIPHeader) + rhdr.data_len) > n) continue;
+
+        std::string js(reinterpret_cast<const char*>(buf + sizeof(DVRIPHeader)),
+                       rhdr.data_len);
+        for (auto& ch : js) if (ch == '\0') ch = ' ';
+
+        json j = json::parse(js, nullptr, false);
+        if (j.is_discarded()) continue;
+
+        json net = j.value("NetWork.NetCommon", json::object());
+        if (!net.is_object()) continue;
+
+        std::string mac = net.value("MAC", "");
+        bool seen = false;
+        for (const auto& d : result) if (d.mac == mac) { seen = true; break; }
+        if (seen) continue;
+
+        DiscoveredDevice dev;
+        dev.ip        = hex_to_ip(net.value("HostIP",   ""));
+        dev.mac       = mac;
+        dev.hostname  = net.value("HostName", "");
+        dev.sn        = net.value("SN",       "");
+        dev.tcp_port  = net.value("TCPPort",  34567);
+        dev.http_port = net.value("HttpPort", 80);
+        result.push_back(std::move(dev));
+    }
+
+    platform_close(sock);
+    return result;
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Encoding settings  (Simplify.Encode)
+// ════════════════════════════════════════════════════════════════════════════════
+
+static void parse_stream_format(const json& j, DVRIPCam::VideoStreamFormat& f) {
+    if (!j.is_object()) return;
+    f.audio_en  = j.value("AudioEnable", false);
+    f.video_en  = j.value("VideoEnable", true);
+    const json& v = j.value("Video", json::object());
+    f.compression  = v.value("Compression",    "H.264");
+    f.resolution   = v.value("Resolution",     "");
+    f.bitrate_ctrl = v.value("BitRateControl", "VBR");
+    f.bitrate      = v.value("BitRate",  0);
+    f.fps          = v.value("FPS",      25);
+    f.gop          = v.value("GOP",      2);
+    f.quality      = v.value("Quality",  4);
+}
+
+static json build_stream_format(const json& existing,
+                                 const DVRIPCam::VideoStreamFormat& f) {
+    json j = existing.is_object() ? existing : json::object();
+    j["AudioEnable"] = f.audio_en;
+    j["VideoEnable"] = f.video_en;
+    json v = j.value("Video", json::object());
+    if (!f.compression.empty())  v["Compression"]    = f.compression;
+    if (!f.resolution.empty())   v["Resolution"]      = f.resolution;
+    if (!f.bitrate_ctrl.empty()) v["BitRateControl"]  = f.bitrate_ctrl;
+    if (f.bitrate > 0)           v["BitRate"]         = f.bitrate;
+    if (f.fps > 0)               v["FPS"]             = f.fps;
+    if (f.gop > 0)               v["GOP"]             = f.gop;
+    if (f.quality > 0)           v["Quality"]         = f.quality;
+    j["Video"] = v;
+    return j;
+}
+
+bool DVRIPCam::get_encode_config(EncodeConfig& out, int channel) {
+    std::string raw = get_info("Simplify.Encode");
+    json arr = json::parse(raw, nullptr, false);
+    if (arr.is_discarded() || !arr.is_array()) return false;
+    if (channel < 0 || channel >= static_cast<int>(arr.size())) return false;
+    const json& ch = arr[channel];
+    parse_stream_format(ch.value("MainFormat",  json::object()), out.main);
+    parse_stream_format(ch.value("ExtraFormat", json::object()), out.extra);
+    return true;
+}
+
+bool DVRIPCam::set_encode_config(const EncodeConfig& cfg, int channel) {
+    std::string raw = get_info("Simplify.Encode");
+    json arr = json::parse(raw, nullptr, false);
+    if (arr.is_discarded() || !arr.is_array()) arr = json::array();
+    while (static_cast<int>(arr.size()) <= channel)
+        arr.push_back(json::object());
+
+    json& ch = arr[channel];
+    ch["MainFormat"]  = build_stream_format(ch.value("MainFormat",  json::object()), cfg.main);
+    ch["ExtraFormat"] = build_stream_format(ch.value("ExtraFormat", json::object()), cfg.extra);
+
+    return set_info("Simplify.Encode", arr.dump());
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Camera / video-color parameters  (AVEnc.VideoColor)
+// ════════════════════════════════════════════════════════════════════════════════
+
+bool DVRIPCam::get_video_color(VideoColorParam& out, int channel, int time_section) {
+    std::string raw = get_info("AVEnc.VideoColor");
+    json arr = json::parse(raw, nullptr, false);
+    // Structure: [[{...},{...}], [...]]  — outer=channel, inner=time_section
+    if (arr.is_discarded() || !arr.is_array()) return false;
+    if (channel < 0 || channel >= static_cast<int>(arr.size())) return false;
+    const json& ch = arr[channel];
+    if (!ch.is_array()) return false;
+    if (time_section < 0 || time_section >= static_cast<int>(ch.size())) return false;
+    const json& sec = ch[time_section];
+    const json& p = sec.value("VideoColorParam", json::object());
+    out.brightness   = p.value("Brightness",   50);
+    out.contrast     = p.value("Contrast",     50);
+    out.saturation   = p.value("Saturation",   50);
+    out.hue          = p.value("Hue",          50);
+    out.sharpness    = p.value("Acutance",      0);
+    out.gain         = p.value("Gain",          0);
+    out.whitebalance = p.value("Whitebalance", 128);
+    return true;
+}
+
+bool DVRIPCam::set_video_color(const VideoColorParam& p, int channel, int time_section) {
+    std::string raw = get_info("AVEnc.VideoColor");
+    json arr = json::parse(raw, nullptr, false);
+    if (arr.is_discarded() || !arr.is_array()) return false;
+    if (channel < 0 || channel >= static_cast<int>(arr.size())) return false;
+    json& ch = arr[channel];
+    if (!ch.is_array()) return false;
+    if (time_section < 0 || time_section >= static_cast<int>(ch.size())) return false;
+    json& sec = ch[time_section];
+    json& vcp = sec["VideoColorParam"];
+    vcp["Brightness"]   = p.brightness;
+    vcp["Contrast"]     = p.contrast;
+    vcp["Saturation"]   = p.saturation;
+    vcp["Hue"]          = p.hue;
+    vcp["Acutance"]     = p.sharpness;
+    vcp["Gain"]         = p.gain;
+    vcp["Whitebalance"] = p.whitebalance;
+    return set_info("AVEnc.VideoColor", arr.dump());
 }
 
 } // namespace cppdvr

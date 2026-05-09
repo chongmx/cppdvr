@@ -14,6 +14,37 @@
 #include <cstring>
 #include <new>
 
+// ── Internal C++ helpers (must live outside extern "C" to allow overloading) ───
+
+static void copy_stream_fmt(DVRVideoStreamFormatC& dst,
+                             const cppdvr::DVRIPCam::VideoStreamFormat& src) {
+    auto cp = [](char* d, size_t n, const std::string& s) {
+        std::strncpy(d, s.c_str(), n - 1); d[n-1] = '\0';
+    };
+    cp(dst.compression,  sizeof(dst.compression),  src.compression);
+    cp(dst.resolution,   sizeof(dst.resolution),   src.resolution);
+    cp(dst.bitrate_ctrl, sizeof(dst.bitrate_ctrl), src.bitrate_ctrl);
+    dst.bitrate       = src.bitrate;
+    dst.fps           = src.fps;
+    dst.gop           = src.gop;
+    dst.quality       = src.quality;
+    dst.video_enable  = src.video_en ? 1 : 0;
+    dst.audio_enable  = src.audio_en ? 1 : 0;
+}
+
+static void copy_stream_fmt(cppdvr::DVRIPCam::VideoStreamFormat& dst,
+                             const DVRVideoStreamFormatC& src) {
+    dst.compression  = src.compression;
+    dst.resolution   = src.resolution;
+    dst.bitrate_ctrl = src.bitrate_ctrl;
+    dst.bitrate      = src.bitrate;
+    dst.fps          = src.fps;
+    dst.gop          = src.gop;
+    dst.quality      = src.quality;
+    dst.video_en     = (src.video_enable != 0);
+    dst.audio_en     = (src.audio_enable != 0);
+}
+
 extern "C" {
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -95,6 +126,203 @@ CPPDVR_API void dvr_sofia_hash(const char* password, char* out_buf, int buf_len)
     std::string hash = cppdvr::DVRIPCam::sofia_hash(password ? password : "");
     std::strncpy(out_buf, hash.c_str(), static_cast<size_t>(buf_len) - 1);
     out_buf[buf_len - 1] = '\0';
+}
+
+CPPDVR_API void dvr_last_error(DVRHandle h, char* out_buf, int buf_len) {
+    if (!out_buf || buf_len < 1) return;
+    if (!h) { out_buf[0] = '\0'; return; }
+    std::string err = static_cast<cppdvr::DVRIPCam*>(h)->last_error();
+    std::strncpy(out_buf, err.c_str(), static_cast<size_t>(buf_len) - 1);
+    out_buf[buf_len - 1] = '\0';
+}
+
+// ── Time ───────────────────────────────────────────────────────────────────────
+
+CPPDVR_API int dvr_get_time(DVRHandle h,
+                              int* year, int* month, int* day,
+                              int* hour, int* minute, int* second) {
+    if (!h) return 0;
+    cppdvr::DVRIPCam::DeviceTime dt;
+    if (!static_cast<cppdvr::DVRIPCam*>(h)->get_time(dt)) return 0;
+    if (year)   *year   = dt.year;
+    if (month)  *month  = dt.month;
+    if (day)    *day    = dt.day;
+    if (hour)   *hour   = dt.hour;
+    if (minute) *minute = dt.minute;
+    if (second) *second = dt.second;
+    return 1;
+}
+
+CPPDVR_API int dvr_set_time(DVRHandle h,
+                              int year, int month, int day,
+                              int hour, int minute, int second) {
+    if (!h) return 0;
+    cppdvr::DVRIPCam::DeviceTime dt{year, month, day, hour, minute, second};
+    return static_cast<cppdvr::DVRIPCam*>(h)->set_time(dt) ? 1 : 0;
+}
+
+// ── Reboot ─────────────────────────────────────────────────────────────────────
+
+CPPDVR_API int dvr_reboot(DVRHandle h) {
+    return (h && static_cast<cppdvr::DVRIPCam*>(h)->reboot()) ? 1 : 0;
+}
+
+// ── OSD / Text overlay ─────────────────────────────────────────────────────────
+
+CPPDVR_API int dvr_set_channel_titles(DVRHandle h,
+                                       const char** titles, int count) {
+    if (!h || !titles || count < 1) return 0;
+    std::vector<std::string> vec;
+    vec.reserve(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i)
+        vec.emplace_back(titles[i] ? titles[i] : "");
+    return static_cast<cppdvr::DVRIPCam*>(h)->set_channel_titles(vec) ? 1 : 0;
+}
+
+CPPDVR_API int dvr_set_channel_bitmap(DVRHandle h,
+                                       int width, int height,
+                                       const uint8_t* bitmap_data,
+                                       size_t bitmap_size) {
+    if (!h || !bitmap_data || bitmap_size == 0) return 0;
+    std::vector<uint8_t> bmp(bitmap_data, bitmap_data + bitmap_size);
+    return static_cast<cppdvr::DVRIPCam*>(h)->set_channel_bitmap(width, height, bmp) ? 1 : 0;
+}
+
+// ── Network settings ───────────────────────────────────────────────────────────
+
+CPPDVR_API int dvr_get_network_info(DVRHandle h, DVRNetworkInfoC* out) {
+    if (!h || !out) return 0;
+    cppdvr::DVRIPCam::NetworkInfo info;
+    if (!static_cast<cppdvr::DVRIPCam*>(h)->get_network_info(info)) return 0;
+    auto copy_str = [](char* dst, size_t n, const std::string& src) {
+        std::strncpy(dst, src.c_str(), n - 1);
+        dst[n - 1] = '\0';
+    };
+    copy_str(out->ip,       sizeof(out->ip),       info.ip);
+    copy_str(out->mask,     sizeof(out->mask),      info.mask);
+    copy_str(out->gateway,  sizeof(out->gateway),   info.gateway);
+    copy_str(out->dns,      sizeof(out->dns),       info.dns);
+    copy_str(out->hostname, sizeof(out->hostname),  info.hostname);
+    copy_str(out->mac,      sizeof(out->mac),       info.mac);
+    out->tcp_port  = info.tcp_port;
+    out->http_port = info.http_port;
+    out->dhcp      = info.dhcp ? 1 : 0;
+    return 1;
+}
+
+CPPDVR_API int dvr_set_network_info(DVRHandle h, const DVRNetworkInfoC* info) {
+    if (!h || !info) return 0;
+    cppdvr::DVRIPCam::NetworkInfo ni;
+    ni.ip        = info->ip;
+    ni.mask      = info->mask;
+    ni.gateway   = info->gateway;
+    ni.dns       = info->dns;
+    ni.hostname  = info->hostname;
+    ni.mac       = info->mac;
+    ni.tcp_port  = info->tcp_port;
+    ni.http_port = info->http_port;
+    ni.dhcp      = (info->dhcp != 0);
+    return static_cast<cppdvr::DVRIPCam*>(h)->set_network_info(ni) ? 1 : 0;
+}
+
+// ── Generic config get/set ─────────────────────────────────────────────────────
+
+CPPDVR_API char* dvr_get_info(DVRHandle h, const char* name) {
+    if (!h || !name) return nullptr;
+    std::string result = static_cast<cppdvr::DVRIPCam*>(h)->get_info(name);
+    if (result.empty()) return nullptr;
+    char* s = new (std::nothrow) char[result.size() + 1];
+    if (!s) return nullptr;
+    std::memcpy(s, result.c_str(), result.size() + 1);
+    return s;
+}
+
+CPPDVR_API int dvr_set_info(DVRHandle h, const char* name, const char* json) {
+    if (!h || !name || !json) return 0;
+    return static_cast<cppdvr::DVRIPCam*>(h)->set_info(name, json) ? 1 : 0;
+}
+
+CPPDVR_API void dvr_free_string(char* s) { delete[] s; }
+
+// ── Device discovery ───────────────────────────────────────────────────────────
+
+CPPDVR_API int dvr_discover(int timeout_ms,
+                              DVRDiscoveredDeviceC** out_arr,
+                              int*                   out_count) {
+    if (!out_arr || !out_count) return 0;
+    *out_arr   = nullptr;
+    *out_count = 0;
+    auto devices = cppdvr::DVRIPCam::discover(timeout_ms > 0 ? timeout_ms : 2000);
+    if (devices.empty()) return 1;
+    auto* arr = new (std::nothrow) DVRDiscoveredDeviceC[devices.size()];
+    if (!arr) return 0;
+    auto copy_str = [](char* dst, size_t n, const std::string& src) {
+        std::strncpy(dst, src.c_str(), n - 1);
+        dst[n - 1] = '\0';
+    };
+    for (size_t i = 0; i < devices.size(); ++i) {
+        const auto& d = devices[i];
+        std::memset(&arr[i], 0, sizeof(arr[i]));
+        copy_str(arr[i].ip,       sizeof(arr[i].ip),       d.ip);
+        copy_str(arr[i].mac,      sizeof(arr[i].mac),       d.mac);
+        copy_str(arr[i].hostname, sizeof(arr[i].hostname),  d.hostname);
+        copy_str(arr[i].sn,       sizeof(arr[i].sn),        d.sn);
+        arr[i].tcp_port  = d.tcp_port;
+        arr[i].http_port = d.http_port;
+    }
+    *out_arr   = arr;
+    *out_count = static_cast<int>(devices.size());
+    return 1;
+}
+
+CPPDVR_API void dvr_free_discovered(DVRDiscoveredDeviceC* arr) { delete[] arr; }
+
+// ── Encoding settings ───────────────────────────────────────────────────────────
+
+CPPDVR_API int dvr_get_encode_config(DVRHandle h, DVREncodeConfigC* out, int channel) {
+    if (!h || !out) return 0;
+    cppdvr::DVRIPCam::EncodeConfig cfg;
+    if (!static_cast<cppdvr::DVRIPCam*>(h)->get_encode_config(cfg, channel)) return 0;
+    copy_stream_fmt(out->main,  cfg.main);
+    copy_stream_fmt(out->extra, cfg.extra);
+    return 1;
+}
+
+CPPDVR_API int dvr_set_encode_config(DVRHandle h, const DVREncodeConfigC* c, int channel) {
+    if (!h || !c) return 0;
+    cppdvr::DVRIPCam::EncodeConfig cfg;
+    copy_stream_fmt(cfg.main,  c->main);
+    copy_stream_fmt(cfg.extra, c->extra);
+    return static_cast<cppdvr::DVRIPCam*>(h)->set_encode_config(cfg, channel) ? 1 : 0;
+}
+
+// ── Video color / camera parameters ────────────────────────────────────────────
+
+CPPDVR_API int dvr_get_video_color(DVRHandle h, DVRVideoColorC* out, int channel) {
+    if (!h || !out) return 0;
+    cppdvr::DVRIPCam::VideoColorParam p;
+    if (!static_cast<cppdvr::DVRIPCam*>(h)->get_video_color(p, channel, 0)) return 0;
+    out->brightness   = p.brightness;
+    out->contrast     = p.contrast;
+    out->saturation   = p.saturation;
+    out->hue          = p.hue;
+    out->sharpness    = p.sharpness;
+    out->gain         = p.gain;
+    out->whitebalance = p.whitebalance;
+    return 1;
+}
+
+CPPDVR_API int dvr_set_video_color(DVRHandle h, const DVRVideoColorC* c, int channel) {
+    if (!h || !c) return 0;
+    cppdvr::DVRIPCam::VideoColorParam p;
+    p.brightness   = c->brightness;
+    p.contrast     = c->contrast;
+    p.saturation   = c->saturation;
+    p.hue          = c->hue;
+    p.sharpness    = c->sharpness;
+    p.gain         = c->gain;
+    p.whitebalance = c->whitebalance;
+    return static_cast<cppdvr::DVRIPCam*>(h)->set_video_color(p, channel, 0) ? 1 : 0;
 }
 
 // ════════════════════════════════════════════════════════════════════════════════

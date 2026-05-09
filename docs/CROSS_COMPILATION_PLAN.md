@@ -1,26 +1,21 @@
-# Cross-Compilation Plan: cppdvr to Linux Shared Library
+# Cross-Compilation: cppdvr Windows + Linux Shared Library
 
-**Status**: Planning Phase  
-**Target Platform**: Linux (Ubuntu 22.04 LTS+)  
+**Status**: **Implemented**  
+**Target Platform**: Linux (Ubuntu 22.04 LTS+) + Windows  
 **Build Type**: Dual-platform (Windows + Linux from single source)  
-**Created**: May 3, 2026
+**Created**: May 3, 2026 | **Completed**: May 9, 2026
 
 ---
 
 ## Executive Summary
 
-This document outlines the strategy to make cppdvr (a Windows-only DVR client library) cross-compilable for Linux as a shared library (`.so`). The approach maintains dual-platform support (Windows `.dll` + Linux `.so`) using a single CMake project with a platform abstraction layer.
+This document describes the platform abstraction strategy used to make cppdvr cross-compilable for Linux as a shared library (`.so`). The implementation is complete — both Windows and Linux build from the same source tree.
 
-### Current State
-- **Windows-specific APIs**: Winsock2 (networking), CryptoAPI (MD5), Windows.h (process management)
-- **Supported Architectures**: Windows only
-- **Export Format**: .dll with C++ and C APIs
-
-### Target State
-- **Cross-platform Support**: Windows (existing) + Linux (new)
-- **Export Formats**: .dll (Windows) + .so (Linux)  
-- **APIs**: Both C++ and C APIs maintained
-- **Dependencies**: OpenSSL on Linux, system sockets and threading
+### Implemented State
+- **Windows**: Winsock2 (networking), CryptoAPI (MD5), CreateProcess (ffmpeg spawn)
+- **Linux/macOS**: POSIX sockets, OpenSSL or built-in MD5, fork/exec
+- **Export Formats**: `.dll` (Windows) + `.so` (Linux/macOS)
+- **APIs**: Both C++ and C APIs work identically on both platforms
 
 ---
 
@@ -459,13 +454,13 @@ src/platform/
 
 ## Success Criteria
 
-- [ ] Windows build produces `.dll` with all public symbols exported
-- [ ] Linux build produces `.so` with all public symbols exported
-- [ ] C++ API callable from Windows and Linux
-- [ ] C API callable from Windows and Linux
-- [ ] DVRIP protocol login works identically on both platforms
-- [ ] Frame callbacks deliver data correctly on both platforms
-- [ ] ffmpeg streaming works on both platforms (if ffmpeg available)
+- [x] Windows build produces `.dll` with all public symbols exported
+- [x] Linux build produces `.so` with all public symbols exported
+- [x] C++ API callable from Windows and Linux
+- [x] C API callable from Windows and Linux
+- [x] DVRIP protocol login works identically on both platforms
+- [x] Frame callbacks deliver data correctly on both platforms
+- [ ] ffmpeg streaming verified on Linux (pending live test)
 - [ ] No memory leaks detected (valgrind on Linux, DrMemory on Windows)
 - [ ] No compilation warnings on either platform
 
@@ -491,6 +486,6 @@ src/platform/
 
 ---
 
-**Document Version**: 1.0  
-**Last Updated**: May 3, 2026  
-**Author**: Planning Phase - Ready for Implementation
+**Document Version**: 1.1  
+**Last Updated**: May 9, 2026  
+**Status**: Implementation complete. All platform abstraction phases (1–5) are done. Phase 6 testing is ongoing.

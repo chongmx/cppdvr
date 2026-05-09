@@ -168,6 +168,8 @@ PlatformSocketError platform_setsockopt(PlatformSocket sock, const std::string& 
         so_optname = SO_SNDTIMEO;
     } else if (opt_name == "SO_REUSEADDR") {
         so_optname = SO_REUSEADDR;
+    } else if (opt_name == "SO_BROADCAST") {
+        so_optname = SO_BROADCAST;
     } else {
         return PlatformSocketError::OptionError;
     }

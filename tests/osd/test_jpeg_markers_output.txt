@@ -1,0 +1,37 @@
+﻿=== JPEG Restart Marker Probe ===
+       Host: 172.20.80.12  User: admin
+[PASS] Login OK
+
+--- Frame source 1 — Snapshot (camera HTTP snapshot endpoint) ---
+       Calling dvr_snapshot() ...
+[FAIL] dvr_snapshot() returned no data
+
+--- Frame source 2 — Stream JPEG (H.265 -> ffmpeg -> JPEG) ---
+       Starting StreamServer, waiting for first decoded JPEG ...
+[PASS] Stream JPEG received: 305114 bytes (298.0 KB)
+[PASS] Saved: probe_stream_frame.jpg
+
+
+--- STREAM JPEG (ffmpeg output) ---
+         off    marker  name
+         -----  ------  -----
+             0  FF D8   SOI
+             2  FF FE   COM  (comment)  len=15
+            19  FF DB   DQT   len=67
+            88  FF C4   DHT   len=208
+           298  FF C0   SOF0 (baseline DCT)  2880 × 1616  Nf=3
+                MCU grid (8×8 baseline): 360 cols × 202 rows = 72720 blocks
+           317  FF DA   SOS   header_len=12  (entropy data follows)
+         305112  FF D9   EOI
+
+       ── Summary: STREAM JPEG (ffmpeg output) ──
+       Image size         : 2880 × 1616  (3 components)
+       MCU grid (8×8)     : 360 × 202 = 72720 blocks
+       DRI segment        : ABSENT (no restart interval declared)
+       RST markers in scan: ABSENT (scan data was present but no RST found)
+
+       VERDICT: No restart markers in this frame
+         MCU-row splice still possible but requires DC accumulation pre-pass
+         (parse entropy bits up to ROI start, track DC predictor, then splice)
+
+=== Results: 3 passed, 1 failed ===

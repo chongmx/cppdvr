@@ -86,6 +86,87 @@ public:
     bool ptz(const std::string& cmd, int step = 5,
              int preset = -1, int channel = 0);
 
+    // ── Time ───────────────────────────────────────────────────────────────────
+    struct DeviceTime {
+        int year = 2000, month = 1, day = 1;
+        int hour = 0, minute = 0, second = 0;
+    };
+    bool get_time(DeviceTime& out);
+    bool set_time(const DeviceTime& dt);
+
+    // ── OSD / Text overlay ─────────────────────────────────────────────────────
+    bool set_channel_titles(const std::vector<std::string>& titles);
+    bool set_channel_bitmap(int width, int height,
+                            const std::vector<uint8_t>& bitmap_data);
+
+    // ── Reboot ─────────────────────────────────────────────────────────────────
+    bool reboot();
+
+    // ── Encoding settings  (Simplify.Encode) ──────────────────────────────────
+    struct VideoStreamFormat {
+        std::string compression;  // "H.264", "H.265", "MPEG4"
+        std::string resolution;   // "5M","4M","3M","1080P","720P","D1","HD1","CIF"
+        std::string bitrate_ctrl; // "VBR" or "CBR"
+        int bitrate    = 0;       // kbps
+        int fps        = 25;
+        int gop        = 2;       // keyframe interval (seconds)
+        int quality    = 4;       // 1–6
+        bool video_en  = true;
+        bool audio_en  = false;
+    };
+    struct EncodeConfig {
+        VideoStreamFormat main;
+        VideoStreamFormat extra;
+    };
+    // channel=0 for single-channel cameras
+    bool get_encode_config(EncodeConfig& out, int channel = 0);
+    bool set_encode_config(const EncodeConfig& cfg, int channel = 0);
+
+    // ── Camera / video-color parameters  (AVEnc.VideoColor) ───────────────────
+    struct VideoColorParam {
+        int brightness   = 50;   // 0–100
+        int contrast     = 50;   // 0–100
+        int saturation   = 50;   // 0–100
+        int hue          = 50;   // 0–100
+        int sharpness    = 0;    // Acutance — camera-specific range
+        int gain         = 0;    // 0–100
+        int whitebalance = 128;  // 0–255
+    };
+    // channel=0, time_section=0 (always-on section)
+    bool get_video_color(VideoColorParam& out, int channel = 0, int time_section = 0);
+    bool set_video_color(const VideoColorParam& p, int channel = 0, int time_section = 0);
+
+    // ── Network settings ───────────────────────────────────────────────────────
+    struct NetworkInfo {
+        std::string ip;
+        std::string mask;
+        std::string gateway;
+        std::string dns;
+        std::string hostname;
+        std::string mac;
+        int         tcp_port  = 34567;
+        int         http_port = 80;
+        bool        dhcp      = false;
+    };
+    bool get_network_info(NetworkInfo& out);
+    bool set_network_info(const NetworkInfo& info);
+
+    // ── Generic config get/set ─────────────────────────────────────────────────
+    std::string get_info(const std::string& name);
+    bool        set_info(const std::string& name, const std::string& data_json);
+
+    // ── Device discovery ───────────────────────────────────────────────────────
+    struct DiscoveredDevice {
+        std::string ip;
+        std::string mac;
+        std::string hostname;
+        std::string sn;
+        int         tcp_port  = 34567;
+        int         http_port = 80;
+    };
+    static std::vector<DiscoveredDevice> discover(int timeout_ms = 2000,
+                                                   const std::string& bind_ip = "");
+
     // ── Generic protocol interface ─────────────────────────────────────────────
     // Returns parsed JSON response (or empty object on error).
     // These match the Python get_command/set_command semantics.
