@@ -13,6 +13,7 @@
 #include "dvrip.h"
 #include "platform/platform_net.h"
 #include "platform/platform_process.h"
+#include "jpeg_overlay.h"
 
 #include <atomic>
 #include <cassert>
@@ -331,6 +332,120 @@ struct StreamServer::Impl {
     std::mutex                raw_frame_cb_mutex;
     StreamServer::RawFrameFn  raw_frame_cb;
 
+    // ── Frame overlay callback (custom RGB drawing) ───────────────────────────
+    std::mutex                    overlay_mutex;
+    StreamServer::OverlayFrameFn  overlay_frame_cb;
+    std::atomic<uint64_t>         overlay_frame_count{0};
+
+    // ── Push-based text overlay (thread-safe double buffer) ───────────────────
+    // back  — user writes here (protected by text_mu)
+    // front — renderer reads from here (swapped under text_mu when dirty)
+    static constexpr size_t kMaxText = StreamServer::kOverlayMaxText;
+    std::mutex text_mu;
+    char       text_back [kMaxText]{};
+    char       text_front[kMaxText]{};
+    bool       text_dirty   {false};
+    int        text_cursor_x{-1};
+    int        text_cursor_y{-1};
+    int        text_scale   { 0};   // 0 = auto (frame_height / 400)
+
+    struct TextSnapshot {
+        char text[kMaxText];
+        int  cx, cy, scale;
+    };
+
+    // Called by user thread — O(kMaxText) copy under lock, then returns.
+    void text_print(const char* src) {
+        std::lock_guard<std::mutex> lk(text_mu);
+        std::strncpy(text_back, src ? src : "", kMaxText - 1);
+        text_back[kMaxText - 1] = '\0';
+        text_dirty = true;
+    }
+    void text_clear() {
+        std::lock_guard<std::mutex> lk(text_mu);
+        text_back[0] = '\0';
+        text_dirty   = true;
+    }
+    void text_set_cursor(int x, int y) {
+        std::lock_guard<std::mutex> lk(text_mu);
+        text_cursor_x = x;
+        text_cursor_y = y;
+    }
+    void text_set_scale(int s) {
+        std::lock_guard<std::mutex> lk(text_mu);
+        text_scale = s;
+    }
+
+    // Called by renderer thread — swaps buffers if dirty, returns snapshot.
+    TextSnapshot text_snap() {
+        TextSnapshot s{};
+        std::lock_guard<std::mutex> lk(text_mu);
+        if (text_dirty) {
+            std::memcpy(text_front, text_back, kMaxText);
+            text_dirty = false;
+        }
+        std::memcpy(s.text, text_front, kMaxText);
+        s.cx    = text_cursor_x;
+        s.cy    = text_cursor_y;
+        s.scale = text_scale;
+        return s;
+    }
+
+    // ── Text box overlay (word-wrap, alignment, anchor) ───────────────────────
+    struct BoxState {
+        static constexpr size_t kBuf = StreamServer::kOverlayMaxText;
+
+        std::mutex mu;
+        // Config — written under mu
+        int  x      {0};
+        int  y      {0};
+        int  box_w  {0};
+        int  scale  {0};    // 0 = auto
+        int  align  {0};    // 0 = left, 1 = right
+        int  anchor {0};    // OVERLAY_ANCHOR_*
+        bool active {false};
+        // Double-buffered text
+        char back [kBuf]{};
+        char front[kBuf]{};
+        bool dirty {false};
+
+        void configure(int _x, int _y, int _bw, int _sc, int _al, int _an) {
+            std::lock_guard<std::mutex> lk(mu);
+            x = _x; y = _y; box_w = _bw; scale = _sc;
+            align = _al; anchor = _an; active = true;
+        }
+        void print(const char* src) {
+            std::lock_guard<std::mutex> lk(mu);
+            std::strncpy(back, src ? src : "", kBuf - 1);
+            back[kBuf - 1] = '\0';
+            dirty = true;
+        }
+        void clear() {
+            std::lock_guard<std::mutex> lk(mu);
+            back[0] = '\0'; dirty = true;
+        }
+
+        struct Snap {
+            char text[kBuf];
+            int  x, y, box_w, scale, align, anchor;
+            bool active, empty;
+        };
+        Snap snap() {
+            Snap s{};
+            std::lock_guard<std::mutex> lk(mu);
+            if (dirty) { std::memcpy(front, back, kBuf); dirty = false; }
+            std::memcpy(s.text, front, kBuf);
+            s.x = x; s.y = y; s.box_w = box_w;
+            s.scale = scale; s.align = align; s.anchor = anchor;
+            s.active = active; s.empty = (front[0] == '\0');
+            return s;
+        }
+    } overlay_boxes[STREAM_OVERLAY_MAX_BOXES];
+
+    // ── Overlay JPEG-ready callback (post-overlay, for recording) ─────────────
+    std::mutex                       overlay_jpeg_cb_mutex;
+    StreamServer::OverlayJpegReadyFn overlay_jpeg_cb;
+
     // ── FPS measurement (video frames only, 100-frame sliding window) ─────────
     // Timestamps of the start and most-recent frame in the current window.
     // Reset on each camera reconnect so a fresh measurement begins per session.
@@ -539,10 +654,96 @@ struct StreamServer::Impl {
                         std::vector<uint8_t> jpeg(d + soi, d + eoi);
                         bool first_frame = latest_jpeg.get().empty();
 
+                        // ── Apply overlay (decode → draw → re-encode) ────────
+                        {
+                            // Snapshot all overlay state before touching pixels
+                            StreamServer::OverlayFrameFn frame_fn;
+                            {
+                                std::lock_guard<std::mutex> lk(overlay_mutex);
+                                frame_fn = overlay_frame_cb;
+                            }
+                            auto tsnap = text_snap();
+
+                            BoxState::Snap bsnaps[STREAM_OVERLAY_MAX_BOXES];
+                            bool has_boxes = false;
+                            for (int bi = 0; bi < STREAM_OVERLAY_MAX_BOXES; ++bi) {
+                                bsnaps[bi] = overlay_boxes[bi].snap();
+                                if (bsnaps[bi].active && !bsnaps[bi].empty)
+                                    has_boxes = true;
+                            }
+
+                            bool has_text  = tsnap.text[0] != '\0';
+                            bool needs_rgb = (frame_fn != nullptr)
+                                             || has_text || has_boxes;
+
+                            if (needs_rgb) {
+                                int w = 0, h = 0;
+                                uint8_t* rgb = jpeg_decode_rgb(
+                                    jpeg.data(), jpeg.size(), &w, &h);
+                                if (rgb) {
+                                    uint64_t ts = ++overlay_frame_count * 40000u;
+
+                                    // Custom frame callback
+                                    if (frame_fn) frame_fn(rgb, ts, w, h);
+
+                                    // Single-region legacy overlay
+                                    if (has_text) {
+                                        int sc = tsnap.scale > 0
+                                                 ? tsnap.scale
+                                                 : (h > 400 ? h / 400 : 1);
+                                        int ox = tsnap.cx >= 0 ? tsnap.cx : 8 * sc;
+                                        int oy;
+                                        if (tsnap.cy >= 0) {
+                                            oy = tsnap.cy;
+                                        } else {
+                                            int nln = 1;
+                                            for (const char* p = tsnap.text; *p; ++p)
+                                                if (*p == '\n') ++nln;
+                                            int bh = nln * 8 * sc;
+                                            oy = (h > bh) ? h - bh : 0;
+                                        }
+                                        jpeg_overlay_draw_text(
+                                            rgb, w, h, tsnap.text,
+                                            ox, oy, 255, 255, 255, sc);
+                                    }
+
+                                    // Text boxes
+                                    for (int bi = 0; bi < STREAM_OVERLAY_MAX_BOXES; ++bi) {
+                                        const auto& b = bsnaps[bi];
+                                        if (!b.active || b.empty) continue;
+                                        int sc = b.scale > 0
+                                                 ? b.scale
+                                                 : (h > 400 ? h / 400 : 1);
+                                        jpeg_overlay_draw_textbox(
+                                            rgb, w, h, b.text,
+                                            b.x, b.y, b.box_w,
+                                            255, 255, 255,
+                                            sc, b.align, b.anchor);
+                                    }
+
+                                    uint8_t* enc = nullptr;
+                                    size_t   esz = 0;
+                                    if (jpeg_encode_rgb(rgb, w, h, 90, &enc, &esz) && enc) {
+                                        jpeg.assign(enc, enc + esz);
+                                        free(enc);
+                                    }
+                                    free(rgb);
+                                }
+                            }
+                        }
+                        // ── End overlay ──────────────────────────────────────
+
                         // Fire JPEG-ready callback before moving (move empties the vector)
                         {
                             std::lock_guard<std::mutex> lk(jpeg_cb_mutex);
                             if (jpeg_cb) jpeg_cb(jpeg.data(), jpeg.size());
+                        }
+
+                        // Fire overlay JPEG callback (post-overlay; used by recorder
+                        // so the GUI can independently use jpeg_cb for display)
+                        {
+                            std::lock_guard<std::mutex> lk(overlay_jpeg_cb_mutex);
+                            if (overlay_jpeg_cb) overlay_jpeg_cb(jpeg.data(), jpeg.size());
                         }
 
                         latest_jpeg.update(std::move(jpeg));
@@ -687,6 +888,42 @@ void StreamServer::set_jpeg_callback(JpegReadyFn fn) {
 void StreamServer::set_raw_frame_callback(RawFrameFn fn) {
     std::lock_guard<std::mutex> lk(d_->raw_frame_cb_mutex);
     d_->raw_frame_cb = std::move(fn);
+}
+
+void StreamServer::overlay_set_cursor(int x, int y) { d_->text_set_cursor(x, y); }
+void StreamServer::overlay_set_scale(int scale)     { d_->text_set_scale(scale); }
+void StreamServer::overlay_print(const char* text)  { d_->text_print(text); }
+void StreamServer::overlay_clear()                  { d_->text_clear(); }
+
+void StreamServer::overlay_box_configure(int idx, int x, int y, int box_w,
+                                          int scale, OverlayAlign align,
+                                          OverlayAnchor anchor) {
+    if (idx < 0 || idx >= kOverlayMaxBoxes) return;
+    d_->overlay_boxes[idx].configure(x, y, box_w, scale,
+                                      static_cast<int>(align),
+                                      static_cast<int>(anchor));
+}
+void StreamServer::overlay_box_print(int idx, const char* text) {
+    if (idx < 0 || idx >= kOverlayMaxBoxes) return;
+    d_->overlay_boxes[idx].print(text);
+}
+void StreamServer::overlay_box_clear(int idx) {
+    if (idx < 0 || idx >= kOverlayMaxBoxes) return;
+    d_->overlay_boxes[idx].clear();
+}
+void StreamServer::overlay_box_clear_all() {
+    for (int i = 0; i < kOverlayMaxBoxes; ++i)
+        d_->overlay_boxes[i].clear();
+}
+
+void StreamServer::set_overlay_frame_callback(OverlayFrameFn fn) {
+    std::lock_guard<std::mutex> lk(d_->overlay_mutex);
+    d_->overlay_frame_cb = std::move(fn);
+}
+
+void StreamServer::set_overlay_jpeg_callback(OverlayJpegReadyFn fn) {
+    std::lock_guard<std::mutex> lk(d_->overlay_jpeg_cb_mutex);
+    d_->overlay_jpeg_cb = std::move(fn);
 }
 
 } // namespace cppdvr

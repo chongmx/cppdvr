@@ -398,6 +398,72 @@ CPPDVR_API void stream_set_jpeg_callback(StreamHandle h,
     }
 }
 
+CPPDVR_API void stream_overlay_set_cursor(StreamHandle h, int x, int y) {
+    if (h) static_cast<cppdvr::StreamServer*>(h)->overlay_set_cursor(x, y);
+}
+CPPDVR_API void stream_overlay_set_scale(StreamHandle h, int scale) {
+    if (h) static_cast<cppdvr::StreamServer*>(h)->overlay_set_scale(scale);
+}
+CPPDVR_API void stream_overlay_print(StreamHandle h, const char* text) {
+    if (h) static_cast<cppdvr::StreamServer*>(h)->overlay_print(text);
+}
+CPPDVR_API void stream_overlay_clear(StreamHandle h) {
+    if (h) static_cast<cppdvr::StreamServer*>(h)->overlay_clear();
+}
+
+CPPDVR_API void stream_overlay_box_configure(StreamHandle h,
+                                              int idx,
+                                              int x, int y,
+                                              int box_w,
+                                              int scale,
+                                              int align,
+                                              int anchor) {
+    if (!h) return;
+    static_cast<cppdvr::StreamServer*>(h)->overlay_box_configure(
+        idx, x, y, box_w, scale,
+        static_cast<cppdvr::StreamServer::OverlayAlign>(align),
+        static_cast<cppdvr::StreamServer::OverlayAnchor>(anchor));
+}
+CPPDVR_API void stream_overlay_box_print(StreamHandle h, int idx, const char* text) {
+    if (h) static_cast<cppdvr::StreamServer*>(h)->overlay_box_print(idx, text);
+}
+CPPDVR_API void stream_overlay_box_clear(StreamHandle h, int idx) {
+    if (h) static_cast<cppdvr::StreamServer*>(h)->overlay_box_clear(idx);
+}
+CPPDVR_API void stream_overlay_box_clear_all(StreamHandle h) {
+    if (h) static_cast<cppdvr::StreamServer*>(h)->overlay_box_clear_all();
+}
+
+CPPDVR_API void stream_set_overlay_frame_callback(StreamHandle h,
+                                                   StreamOverlayFrameCallback cb,
+                                                   void* userdata) {
+    if (!h) return;
+    auto* srv = static_cast<cppdvr::StreamServer*>(h);
+    if (cb)
+        srv->set_overlay_frame_callback(
+            [cb, userdata](uint8_t* rgb, uint64_t ts, int w, int ht) {
+                cb(rgb, ts, w, ht, 3, userdata);
+            });
+    else
+        srv->set_overlay_frame_callback(nullptr);
+}
+
+CPPDVR_API void stream_set_overlay_jpeg_callback(StreamHandle h,
+                                                  StreamOverlayJpegCallback cb,
+                                                  void* userdata) {
+    if (!h) return;
+    auto* srv = static_cast<cppdvr::StreamServer*>(h);
+    if (cb) {
+        auto* counter = new uint32_t{0};
+        srv->set_overlay_jpeg_callback(
+            [cb, userdata, counter](const uint8_t* jpeg, size_t size) {
+                cb(jpeg, size, ++(*counter), userdata);
+            });
+    } else {
+        srv->set_overlay_jpeg_callback(nullptr);
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 // UDP Stream Server C API
 // ════════════════════════════════════════════════════════════════════════════════

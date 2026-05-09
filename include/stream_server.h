@@ -80,8 +80,18 @@ public:
     // pipeline thread).  Use this to forward frames over UDP or any other
     // transport without polling get_latest_frame().
     // Set before start(); safe to replace at any time.
+    // NOTE: This slot is typically owned by the GUI application for display.
+    //       For overlay recording use set_overlay_jpeg_callback() instead.
     using JpegReadyFn = std::function<void(const uint8_t* jpeg, size_t size)>;
     void set_jpeg_callback(JpegReadyFn fn);
+
+    // Fired with the POST-overlay JPEG for every frame (after any overlay
+    // text/frame callbacks have been applied and re-encoded).
+    // When no overlay callbacks are set the data is identical to jpeg_cb.
+    // Use this slot for recording the overlaid stream so that the GUI can
+    // independently use set_jpeg_callback() for display without conflict.
+    using OverlayJpegReadyFn = std::function<void(const uint8_t* jpeg, size_t size)>;
+    void set_overlay_jpeg_callback(OverlayJpegReadyFn fn);
 
     // Optional callback fired for every raw H264/H265 NAL video frame received
     // from the DVR (camera thread), before it enters the JPEG decode pipeline.
@@ -93,6 +103,88 @@ public:
                                            const std::string& codec_hint,
                                            bool is_iframe)>;
     void set_raw_frame_callback(RawFrameFn fn);
+
+    // ── Text overlay constants ─────────────────────────────────────────────────
+
+    // Maximum text per overlay region (bytes incl. null terminator).
+    // Excess is silently truncated.
+    static constexpr size_t kOverlayMaxText = 512;
+
+    // Maximum simultaneous text boxes.
+    // Recompile with -DSTREAM_OVERLAY_MAX_BOXES=N to raise the limit.
+#ifndef STREAM_OVERLAY_MAX_BOXES
+#  define STREAM_OVERLAY_MAX_BOXES 4
+#endif
+    static constexpr int kOverlayMaxBoxes = STREAM_OVERLAY_MAX_BOXES;
+
+    enum class OverlayAlign  { Left = 0, Right = 1 };
+    enum class OverlayAnchor {
+        TopLeft     = 0,
+        TopRight    = 1,
+        BottomLeft  = 2,
+        BottomRight = 3
+    };
+
+    // ── Push-based single-region overlay ─────────────────────────────────────
+    // Quick single-box overlay (no word-wrap, auto bottom-left position).
+    // For word-wrap, alignment, and multiple regions use overlay_box_* below.
+    // '\n' in text starts a new line at the same x origin.
+
+    // Set the pixel origin for the top-left of the first character.
+    // Pass x=-1, y=-1 to use the auto default: bottom-left with a margin that
+    // scales proportionally with the frame height.
+    void overlay_set_cursor(int x, int y);
+
+    // Set the glyph scale factor (each font pixel becomes scale×scale screen pixels).
+    // 1 = native 8×8 px glyphs.  Pass 0 for auto-scale (frame_height / 400).
+    void overlay_set_scale(int scale);
+
+    // Replace the current overlay text.  Supports '\n' for multiple lines.
+    // Thread-safe; safe to call at any rate from any thread.
+    void overlay_print(const char* text);
+
+    // Clear the overlay (no text drawn until next overlay_print).
+    void overlay_clear();
+
+    // ── Text box overlay (multiple regions, word-wrap, alignment) ────────────
+    // Up to kOverlayMaxBoxes independent boxes, each with its own position,
+    // size, scale, alignment, and anchor corner.
+    //
+    // Box layout:
+    //   x, y   — inward pixel offset from the anchor corner.
+    //   box_w  — text-box width in pixels:
+    //              • controls word-wrap (text wider than box_w wraps to next line)
+    //              • required for OverlayAlign::Right (right edge = x + box_w)
+    //              • 0 = unconstrained (only '\n' causes line breaks)
+    //   scale  — glyph scale factor (0 = auto: frame_height / 400, min 1).
+    //   align  — Left or Right within box_w.
+    //   anchor — which image corner x,y are measured from.
+    //
+    // All calls are thread-safe.  Text is double-buffered: the renderer always
+    // sees a fully-committed snapshot, never a partially-written string.
+    // '\n' in text always forces an explicit line break.
+
+    // Configure a box (call before overlay_box_print; idx must be 0…kOverlayMaxBoxes-1).
+    void overlay_box_configure(int idx, int x, int y, int box_w,
+                               int scale, OverlayAlign align,
+                               OverlayAnchor anchor = OverlayAnchor::TopLeft);
+
+    // Set display text for box idx.  Thread-safe.
+    void overlay_box_print(int idx, const char* text);
+
+    // Hide box idx (stops drawing until next overlay_box_print).
+    void overlay_box_clear(int idx);
+
+    // Hide all boxes.
+    void overlay_box_clear_all();
+
+    // ── Frame overlay callback ─────────────────────────────────────────────────
+    // For custom drawing: called with the raw RGB buffer every frame.
+    // Triggers a full JPEG decode → RGB → re-encode cycle when set.
+    // rgb points to width * height * 3 bytes (packed R, G, B; no padding).
+    using OverlayFrameFn = std::function<void(uint8_t* rgb, uint64_t ts_us,
+                                               int w, int h)>;
+    void set_overlay_frame_callback(OverlayFrameFn fn);
 
 private:
     struct Impl;

@@ -124,6 +124,7 @@ add_library(cppdvr SHARED
     src/stream_server.cpp
     src/udp_stream_server.cpp
     src/video_recorder.cpp
+    src/jpeg_overlay.cpp
 )
 
 # Namespaced alias — parent projects use: target_link_libraries(myapp PRIVATE cppdvr::cppdvr)
@@ -134,7 +135,9 @@ target_include_directories(cppdvr
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
     PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/src/platform
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
 )
 
 target_link_libraries(cppdvr PRIVATE

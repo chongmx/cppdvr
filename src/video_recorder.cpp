@@ -117,14 +117,28 @@ struct FfmpegRecProc {
             args.insert(args.end(), { "-y", filename });
 
         } else {
-            // MJPEG AVI: re-encode with explicit pixel format for broad player compat
+            // JPEG-frame input mode.
+            // Output encoding is chosen from the filename extension:
+            //   .mp4  → libx264 H.264 (broad compat, smaller files)
+            //   other → MJPEG in AVI  (lossless JPEG passthrough)
+            const bool to_mp4 = filename.size() > 4 &&
+                                  filename.substr(filename.size() - 4) == ".mp4";
             args.insert(args.end(), {
                 "-f", "image2pipe", "-vcodec", "mjpeg",
                 "-framerate", std::to_string(framerate),
-                "-i", "pipe:0",
-                "-c:v", "mjpeg", "-pix_fmt", "yuvj420p", "-q:v", "3",
-                "-y", filename
+                "-i", "pipe:0"
             });
+            if (to_mp4) {
+                args.insert(args.end(), {
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-crf", "18", "-preset", "veryfast"
+                });
+            } else {
+                args.insert(args.end(), {
+                    "-c:v", "mjpeg", "-pix_fmt", "yuvj420p", "-q:v", "3"
+                });
+            }
+            args.insert(args.end(), { "-y", filename });
         }
 
         if (log_fn) {

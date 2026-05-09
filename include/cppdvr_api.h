@@ -244,6 +244,104 @@ CPPDVR_API void stream_set_jpeg_callback(StreamHandle h,
                                           StreamJpegCallback cb,
                                           void* userdata);
 
+// ── Overlay constants ─────────────────────────────────────────────────────────
+#define STREAM_OVERLAY_MAX_TEXT 512
+
+// Maximum number of simultaneous text boxes.
+// Recompile with -DSTREAM_OVERLAY_MAX_BOXES=N to raise the limit.
+#ifndef STREAM_OVERLAY_MAX_BOXES
+#  define STREAM_OVERLAY_MAX_BOXES 4
+#endif
+
+// Alignment within a text box
+#define STREAM_OVERLAY_ALIGN_LEFT  0
+#define STREAM_OVERLAY_ALIGN_RIGHT 1
+
+// Anchor corner — x,y in stream_overlay_box_configure are inward offsets from this corner
+#define STREAM_OVERLAY_ANCHOR_TOP_LEFT     0
+#define STREAM_OVERLAY_ANCHOR_TOP_RIGHT    1
+#define STREAM_OVERLAY_ANCHOR_BOTTOM_LEFT  2
+#define STREAM_OVERLAY_ANCHOR_BOTTOM_RIGHT 3
+
+// ── Push-based single-region overlay ─────────────────────────────────────────
+// Quick single-box overlay (no word-wrap, auto bottom-left position).
+// For word-wrap, alignment, and multiple regions use stream_overlay_box_* below.
+// '\n' starts a new line at the same x origin.
+
+// Set pixel origin for the first character.
+// Pass x=-1, y=-1 for the auto default: bottom-left, margin scales with height.
+CPPDVR_API void stream_overlay_set_cursor(StreamHandle h, int x, int y);
+
+// Set glyph scale factor (1 = native 8×8 px, 2 = 16×16, 4 = 32×32, etc.).
+// Pass 0 for auto-scale (frame_height / 400, minimum 1).
+CPPDVR_API void stream_overlay_set_scale(StreamHandle h, int scale);
+
+// Replace overlay text.  Supports '\n' for multiple lines.
+// Thread-safe — safe to call from any thread at any rate.
+CPPDVR_API void stream_overlay_print(StreamHandle h, const char* text);
+
+// Clear overlay (nothing drawn until next stream_overlay_print).
+CPPDVR_API void stream_overlay_clear(StreamHandle h);
+
+// ── Text box overlay (word-wrap, alignment, anchor) ───────────────────────────
+// Up to STREAM_OVERLAY_MAX_BOXES independent regions, each with its own layout.
+// All functions are thread-safe.
+//
+// Layout parameters for stream_overlay_box_configure():
+//   idx    — box index 0 … STREAM_OVERLAY_MAX_BOXES-1
+//   x, y   — inward pixel offset from the anchor corner
+//   box_w  — text-box width in pixels:
+//               • text wider than box_w word-wraps to the next line
+//               • required for ALIGN_RIGHT (right edge = anchor_x + box_w)
+//               • 0 = unconstrained (only '\n' causes line breaks)
+//   scale  — glyph scale factor (1 = native 8×8 px; 0 = auto frame_height/400)
+//   align  — STREAM_OVERLAY_ALIGN_LEFT or STREAM_OVERLAY_ALIGN_RIGHT
+//   anchor — STREAM_OVERLAY_ANCHOR_* corner x,y are measured from
+
+CPPDVR_API void stream_overlay_box_configure(StreamHandle h,
+                                              int idx,
+                                              int x, int y,
+                                              int box_w,
+                                              int scale,
+                                              int align,
+                                              int anchor);
+
+// Set display text for box idx ('\n' and word-wrap both create new lines).
+// Thread-safe — safe to call at any rate from any thread.
+CPPDVR_API void stream_overlay_box_print(StreamHandle h, int idx, const char* text);
+
+// Hide box idx (nothing drawn until next stream_overlay_box_print).
+CPPDVR_API void stream_overlay_box_clear(StreamHandle h, int idx);
+
+// Hide all boxes.
+CPPDVR_API void stream_overlay_box_clear_all(StreamHandle h);
+
+// ── Frame overlay callback ────────────────────────────────────────────────────
+// For custom drawing directly into the raw RGB buffer every frame.
+// Triggers a JPEG decode → RGB → re-encode cycle when set.
+// rgb            — packed R,G,B pixels; width * height * 3 bytes total.
+// bytes_per_pixel — always 3.
+typedef void (*StreamOverlayFrameCallback)(uint8_t* rgb,
+                                           uint64_t ts_us,
+                                           int      width,
+                                           int      height,
+                                           int      bytes_per_pixel,
+                                           void*    userdata);
+CPPDVR_API void stream_set_overlay_frame_callback(StreamHandle h,
+                                                   StreamOverlayFrameCallback cb,
+                                                   void* userdata);
+
+// ── Overlay JPEG callback ─────────────────────────────────────────────────────
+// Fired with the POST-overlay JPEG for every frame.
+// When no overlay callbacks are set the data is identical to StreamJpegCallback.
+// Use this slot for recording the overlaid stream; the JPEG callback slot is
+// then free for the GUI to use for display without conflict.
+typedef void (*StreamOverlayJpegCallback)(const uint8_t* jpeg, size_t size,
+                                           uint32_t frame_id, void* userdata);
+CPPDVR_API void stream_set_overlay_jpeg_callback(StreamHandle h,
+                                                  StreamOverlayJpegCallback cb,
+                                                  void* userdata);
+
 // ════════════════════════════════════════════════════════════════════════════════
 // UDP Stream Server API  (XrRobotOperator XRRO v1 protocol)
 // ════════════════════════════════════════════════════════════════════════════════
