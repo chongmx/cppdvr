@@ -145,11 +145,28 @@ target_include_directories(cppdvr
 option(CPPDVR_LIBJPEG_TURBO "Enable libjpeg-turbo SIMD-accelerated JPEG backend" ON)
 if(CPPDVR_LIBJPEG_TURBO)
     # 1. Try vcpkg / CMake-config install
-    find_package(libjpeg-turbo CONFIG QUIET)
+    #    Also hint the default winget install location on Windows.
+    find_package(libjpeg-turbo CONFIG QUIET
+        HINTS "C:/libjpeg-turbo64"        # winget: libjpeg-turbo.libjpeg-turbo.VC (64-bit)
+              "C:/libjpeg-turbo"          # winget: libjpeg-turbo.libjpeg-turbo.VC (32-bit)
+    )
     if(libjpeg-turbo_FOUND)
         message(STATUS "JPEG backend: libjpeg-turbo (CMake config)")
         target_compile_definitions(cppdvr PRIVATE CPPDVR_HAS_LIBJPEG_TURBO)
-        if(TARGET libjpeg-turbo::turbojpeg-static)
+        if(WIN32)
+            # On Windows the pre-built static lib uses /MT; our DLL uses /MD — mismatch.
+            # Link the dynamic turbojpeg.dll (import lib) to avoid the CRT conflict.
+            target_link_libraries(cppdvr PRIVATE libjpeg-turbo::turbojpeg)
+            # Copy turbojpeg.dll next to cppdvr.dll so it is found at runtime.
+            get_target_property(_tj_dll libjpeg-turbo::turbojpeg IMPORTED_LOCATION_RELEASE)
+            if(_tj_dll AND NOT _tj_dll STREQUAL "_tj_dll-NOTFOUND")
+                add_custom_command(TARGET cppdvr POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_tj_dll}" "$<TARGET_FILE_DIR:cppdvr>"
+                    COMMENT "Copying turbojpeg.dll to output directory"
+                )
+            endif()
+        elseif(TARGET libjpeg-turbo::turbojpeg-static)
             target_link_libraries(cppdvr PRIVATE libjpeg-turbo::turbojpeg-static)
         else()
             target_link_libraries(cppdvr PRIVATE libjpeg-turbo::turbojpeg)
@@ -166,7 +183,8 @@ if(CPPDVR_LIBJPEG_TURBO)
             target_link_libraries(cppdvr PRIVATE PkgConfig::TURBOJPEG)
         else()
             message(STATUS "JPEG backend: libjpeg-turbo NOT found — using stb_image fallback")
-            message(STATUS "  Install hint (Windows/vcpkg): vcpkg install libjpeg-turbo:x64-windows")
+            message(STATUS "  Install hint (Windows/winget): winget install libjpeg-turbo.libjpeg-turbo.VC")
+            message(STATUS "  Install hint (Windows/vcpkg):  vcpkg install libjpeg-turbo:x64-windows")
             message(STATUS "  Install hint (Ubuntu):        sudo apt install libturbojpeg0-dev")
             message(STATUS "  Install hint (macOS):         brew install jpeg-turbo")
             set(CPPDVR_LIBJPEG_TURBO OFF CACHE BOOL "" FORCE)
