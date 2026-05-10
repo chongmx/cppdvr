@@ -140,6 +140,61 @@ target_include_directories(cppdvr
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
 )
 
+# ── JPEG backend: libjpeg-turbo (SIMD — cross-platform) ──────────────────────
+# Enabled by default; disable with -DCPPDVR_LIBJPEG_TURBO=OFF
+option(CPPDVR_LIBJPEG_TURBO "Enable libjpeg-turbo SIMD-accelerated JPEG backend" ON)
+if(CPPDVR_LIBJPEG_TURBO)
+    # 1. Try vcpkg / CMake-config install
+    find_package(libjpeg-turbo CONFIG QUIET)
+    if(libjpeg-turbo_FOUND)
+        message(STATUS "JPEG backend: libjpeg-turbo (CMake config)")
+        target_compile_definitions(cppdvr PRIVATE CPPDVR_HAS_LIBJPEG_TURBO)
+        if(TARGET libjpeg-turbo::turbojpeg-static)
+            target_link_libraries(cppdvr PRIVATE libjpeg-turbo::turbojpeg-static)
+        else()
+            target_link_libraries(cppdvr PRIVATE libjpeg-turbo::turbojpeg)
+        endif()
+    else()
+        # 2. Try pkg-config (Linux/macOS system install)
+        find_package(PkgConfig QUIET)
+        if(PKG_CONFIG_FOUND)
+            pkg_check_modules(TURBOJPEG QUIET IMPORTED_TARGET libturbojpeg)
+        endif()
+        if(TURBOJPEG_FOUND)
+            message(STATUS "JPEG backend: libjpeg-turbo (pkg-config ${TURBOJPEG_VERSION})")
+            target_compile_definitions(cppdvr PRIVATE CPPDVR_HAS_LIBJPEG_TURBO)
+            target_link_libraries(cppdvr PRIVATE PkgConfig::TURBOJPEG)
+        else()
+            message(STATUS "JPEG backend: libjpeg-turbo NOT found — using stb_image fallback")
+            message(STATUS "  Install hint (Windows/vcpkg): vcpkg install libjpeg-turbo:x64-windows")
+            message(STATUS "  Install hint (Ubuntu):        sudo apt install libturbojpeg0-dev")
+            message(STATUS "  Install hint (macOS):         brew install jpeg-turbo")
+            set(CPPDVR_LIBJPEG_TURBO OFF CACHE BOOL "" FORCE)
+        endif()
+    endif()
+endif()
+
+# ── JPEG backend: nvJPEG (NVIDIA GPU) ────────────────────────────────────────
+# Disabled by default; enable with -DCPPDVR_NVJPEG=ON (requires CUDA toolkit)
+option(CPPDVR_NVJPEG "Enable nvJPEG GPU-accelerated JPEG backend (requires CUDA toolkit)" OFF)
+if(CPPDVR_NVJPEG)
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        if(TARGET CUDA::nvjpeg)
+            message(STATUS "JPEG backend: nvJPEG (CUDA ${CUDAToolkit_VERSION})")
+            target_compile_definitions(cppdvr PRIVATE CPPDVR_HAS_NVJPEG)
+            target_link_libraries(cppdvr PRIVATE CUDA::nvjpeg CUDA::cudart)
+        else()
+            message(WARNING "CPPDVR_NVJPEG=ON: CUDA ${CUDAToolkit_VERSION} found but nvJPEG target missing — nvJPEG disabled")
+            set(CPPDVR_NVJPEG OFF CACHE BOOL "" FORCE)
+        endif()
+    else()
+        message(WARNING "CPPDVR_NVJPEG=ON: CUDA toolkit not found — nvJPEG disabled")
+        message(STATUS "  Install: https://developer.nvidia.com/cuda-downloads")
+        set(CPPDVR_NVJPEG OFF CACHE BOOL "" FORCE)
+    endif()
+endif()
+
 target_link_libraries(cppdvr PRIVATE
     nlohmann_json::nlohmann_json
     ${PLATFORM_LIBS}

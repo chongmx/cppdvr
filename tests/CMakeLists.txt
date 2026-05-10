@@ -54,3 +54,6 @@ add_dvr_test(test_overlay_record osd/test_overlay_record.c)
 add_dvr_test(test_dual_record    osd/test_dual_record.c)
 add_dvr_test(test_overlay_only   osd/test_overlay_only.c)
 add_dvr_test(test_raw_only       osd/test_raw_only.c)
+
+# ── Performance benchmarks ───────────────────────────────────────────────────
+add_dvr_test(bench_jpeg_backends perf/bench_jpeg_backends.c)

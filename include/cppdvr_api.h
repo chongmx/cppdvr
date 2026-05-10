@@ -244,6 +244,47 @@ CPPDVR_API void stream_set_jpeg_callback(StreamHandle h,
                                           StreamJpegCallback cb,
                                           void* userdata);
 
+// ── JPEG decode/encode backend ────────────────────────────────────────────────
+// All stream instances in this process share one active backend.
+// Keep in sync with JPEG_BACKEND_* in src/jpeg_overlay.h.
+
+#define CPPDVR_JPEG_BACKEND_STB           0   // stb_image (default, always available)
+#define CPPDVR_JPEG_BACKEND_LIBJPEG_TURBO 1   // libjpeg-turbo (SIMD: SSE/AVX/NEON)
+#define CPPDVR_JPEG_BACKEND_NVJPEG        2   // nvJPEG (NVIDIA GPU)
+
+// Returns 1 if this backend was compiled in and hardware is present.
+// Calling this for NVJPEG performs a lazy GPU init on the first call.
+CPPDVR_API int cppdvr_jpeg_backend_available(int backend);
+
+// Switch the active backend. Returns 1 on success, 0 if unavailable.
+// On failure the previously active backend is unchanged.
+CPPDVR_API int cppdvr_set_jpeg_backend(int backend);
+
+// Return the currently active backend (one of CPPDVR_JPEG_BACKEND_*).
+CPPDVR_API int cppdvr_get_jpeg_backend(void);
+
+// Convenience wrappers on a StreamHandle (delegates to the process-level above).
+CPPDVR_API int stream_set_jpeg_backend(StreamHandle h, int backend);
+CPPDVR_API int stream_get_jpeg_backend(StreamHandle h);
+
+// Decode a JPEG to packed RGB (3 bytes/pixel).
+// Returns heap-allocated buffer; caller must free with cppdvr_jpeg_free().
+// *out_width and *out_height are set on success. Returns NULL on failure.
+// Uses the backend set by cppdvr_set_jpeg_backend().
+CPPDVR_API uint8_t* cppdvr_jpeg_decode(const uint8_t* jpeg, size_t size,
+                                        int* out_width, int* out_height);
+
+// Encode packed RGB (3 bytes/pixel) to JPEG.
+// Returns heap-allocated JPEG buffer; caller must free with cppdvr_jpeg_free().
+// *out_size is set on success. Returns NULL on failure.
+// quality: 1 (worst) to 100 (best).
+CPPDVR_API uint8_t* cppdvr_jpeg_encode(const uint8_t* rgb,
+                                        int width, int height,
+                                        int quality, size_t* out_size);
+
+// Free a buffer returned by cppdvr_jpeg_decode() or cppdvr_jpeg_encode().
+CPPDVR_API void cppdvr_jpeg_free(uint8_t* buf);
+
 // ── Overlay constants ─────────────────────────────────────────────────────────
 #define STREAM_OVERLAY_MAX_TEXT 512
 

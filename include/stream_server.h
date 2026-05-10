@@ -178,6 +178,25 @@ public:
     // Hide all boxes.
     void overlay_box_clear_all();
 
+    // ── JPEG decode/encode backend ────────────────────────────────────────────────
+    // All stream instances in this process share the active backend.
+    // Switch at any time; takes effect on the next overlay decode/encode call.
+    enum class JpegBackend {
+        STB           = 0,  // stb_image (default, always available, no extra deps)
+        LibJpegTurbo  = 1,  // libjpeg-turbo: SIMD (SSE2/AVX2/NEON) — cross-platform
+        NvJPEG        = 2,  // nvJPEG: NVIDIA GPU — lowest latency at high resolution
+    };
+
+    // Returns true if this backend was compiled in and hardware is available.
+    // Calling jpeg_backend_available(NvJPEG) performs a lazy GPU init on the first call.
+    static bool jpeg_backend_available(JpegBackend backend);
+
+    // Switch the active backend. Returns false if unavailable (current backend unchanged).
+    bool set_jpeg_backend(JpegBackend backend);
+
+    // Return the currently active backend.
+    JpegBackend get_jpeg_backend() const;
+
     // ── Frame overlay callback ─────────────────────────────────────────────────
     // For custom drawing: called with the raw RGB buffer every frame.
     // Triggers a full JPEG decode → RGB → re-encode cycle when set.

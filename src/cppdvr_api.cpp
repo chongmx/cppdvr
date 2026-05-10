@@ -10,7 +10,9 @@
 #include "stream_server.h"
 #include "udp_stream_server.h"
 #include "video_recorder.h"
+#include "jpeg_overlay.h"   // jpeg_backend_*, jpeg_decode_rgb, jpeg_encode_rgb
 
+#include <cstdlib>
 #include <cstring>
 #include <new>
 
@@ -396,6 +398,46 @@ CPPDVR_API void stream_set_jpeg_callback(StreamHandle h,
     } else {
         srv->set_jpeg_callback(nullptr);
     }
+}
+
+// ── JPEG backend ──────────────────────────────────────────────────────────────
+
+CPPDVR_API int cppdvr_jpeg_backend_available(int backend) {
+    return jpeg_backend_available(backend);
+}
+CPPDVR_API int cppdvr_set_jpeg_backend(int backend) {
+    return jpeg_backend_set(backend);
+}
+CPPDVR_API int cppdvr_get_jpeg_backend(void) {
+    return jpeg_backend_get();
+}
+
+CPPDVR_API int stream_set_jpeg_backend(StreamHandle h, int backend) {
+    if (!h) return 0;
+    auto* srv = static_cast<cppdvr::StreamServer*>(h);
+    return srv->set_jpeg_backend(
+        static_cast<cppdvr::StreamServer::JpegBackend>(backend)) ? 1 : 0;
+}
+CPPDVR_API int stream_get_jpeg_backend(StreamHandle h) {
+    if (!h) return CPPDVR_JPEG_BACKEND_STB;
+    return static_cast<int>(
+        static_cast<cppdvr::StreamServer*>(h)->get_jpeg_backend());
+}
+
+CPPDVR_API uint8_t* cppdvr_jpeg_decode(const uint8_t* jpeg, size_t size,
+                                        int* out_width, int* out_height) {
+    return jpeg_decode_rgb(jpeg, size, out_width, out_height);
+}
+CPPDVR_API uint8_t* cppdvr_jpeg_encode(const uint8_t* rgb,
+                                        int width, int height,
+                                        int quality, size_t* out_size) {
+    if (!out_size) return nullptr;
+    uint8_t* buf = nullptr;
+    jpeg_encode_rgb(rgb, width, height, quality, &buf, out_size);
+    return buf;
+}
+CPPDVR_API void cppdvr_jpeg_free(uint8_t* buf) {
+    free(buf);
 }
 
 CPPDVR_API void stream_overlay_set_cursor(StreamHandle h, int x, int y) {

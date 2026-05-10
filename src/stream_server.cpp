@@ -926,4 +926,16 @@ void StreamServer::set_overlay_jpeg_callback(OverlayJpegReadyFn fn) {
     d_->overlay_jpeg_cb = std::move(fn);
 }
 
+bool StreamServer::jpeg_backend_available(JpegBackend backend) {
+    return ::jpeg_backend_available(static_cast<int>(backend)) != 0;
+}
+
+bool StreamServer::set_jpeg_backend(JpegBackend backend) {
+    return ::jpeg_backend_set(static_cast<int>(backend)) != 0;
+}
+
+StreamServer::JpegBackend StreamServer::get_jpeg_backend() const {
+    return static_cast<JpegBackend>(::jpeg_backend_get());
+}
+
 } // namespace cppdvr
