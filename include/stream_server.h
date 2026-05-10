@@ -42,6 +42,22 @@ struct StreamServerConfig {
     //   e.g. jpeg_scale_w=416, jpeg_scale_h=0  →  ffmpeg -vf scale=416:-1
     int         jpeg_scale_w = 0;
     int         jpeg_scale_h = 0;
+
+    // Hardware-accelerated H.264/H.265 decode inside ffmpeg.
+    // Passed verbatim as: ffmpeg -hwaccel <value> ...
+    // Common values:
+    //   "auto"    — ffmpeg picks the best available (d3d11va on Windows, vaapi on Linux)
+    //   "cuda"    — NVIDIA NVDEC (requires CUDA-capable GPU and ffmpeg built with NVDEC)
+    //   "d3d11va" — DirectX 11 Video Acceleration (Windows; Intel/AMD/NVIDIA)
+    //   "vaapi"   — Video Acceleration API (Linux; Intel/AMD)
+    //   ""        — software decode (disable hardware acceleration)
+    std::string ffmpeg_hwaccel = "auto";
+
+    // When true, StreamServer::start() automatically selects the fastest available
+    // JPEG backend (libjpeg-turbo > stb_image) if the process-global backend is
+    // still at the default (STB). Set false if you want to manage the backend
+    // yourself via cppdvr_set_jpeg_backend() before calling start().
+    bool        auto_jpeg_backend = true;
 };
 
 class CPPDVR_API StreamServer {

@@ -209,6 +209,21 @@ CPPDVR_API void stream_destroy(StreamHandle h);
 // Returns non-zero on success.
 CPPDVR_API int stream_start(StreamHandle h, const char* stream_type);
 
+// ── Hardware acceleration ──────────────────────────────────────────────────────
+// Set the ffmpeg -hwaccel mode used for H.264/H.265 decoding.
+// Must be called before stream_start().  Pass "" to disable hardware decode.
+// Common values: "auto" (default), "cuda", "d3d11va" (Windows), "vaapi" (Linux).
+// "auto" lets ffmpeg pick the best available accelerator on the current host.
+CPPDVR_API void stream_set_hwaccel(StreamHandle h, const char* hwaccel);
+
+// Get the currently configured hwaccel string.
+// Writes into out_buf (null-terminated, at most buf_len bytes).
+CPPDVR_API void stream_get_hwaccel(StreamHandle h, char* out_buf, int buf_len);
+
+// Control whether stream_start() auto-selects the fastest available JPEG backend.
+// Default: 1 (enabled).  Set to 0 if you call cppdvr_set_jpeg_backend() yourself.
+CPPDVR_API void stream_set_auto_jpeg_backend(StreamHandle h, int enabled);
+
 // Stop all threads gracefully.
 CPPDVR_API void stream_stop(StreamHandle h);
 

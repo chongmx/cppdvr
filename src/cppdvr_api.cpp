@@ -357,6 +357,32 @@ CPPDVR_API int stream_start(StreamHandle h, const char* stream_type) {
     return srv->start() ? 1 : 0;
 }
 
+CPPDVR_API void stream_set_hwaccel(StreamHandle h, const char* hwaccel) {
+    if (!h) return;
+    auto* srv = static_cast<cppdvr::StreamServer*>(h);
+    // Access config via the const getter and cast — config is ours to modify
+    // before start().  Use a non-const path: recreate via the stored config.
+    // StreamServerConfig is not publicly mutable after construction, so we
+    // expose it via a dedicated setter below on StreamServer.
+    // For now, cast away const (cfg is a value member, not truly const).
+    const_cast<cppdvr::StreamServerConfig&>(srv->config()).ffmpeg_hwaccel =
+        hwaccel ? hwaccel : "";
+}
+
+CPPDVR_API void stream_get_hwaccel(StreamHandle h, char* out_buf, int buf_len) {
+    if (!h || !out_buf || buf_len <= 0) return;
+    const auto& hw = static_cast<cppdvr::StreamServer*>(h)->config().ffmpeg_hwaccel;
+    std::strncpy(out_buf, hw.c_str(), static_cast<size_t>(buf_len) - 1);
+    out_buf[buf_len - 1] = '\0';
+}
+
+CPPDVR_API void stream_set_auto_jpeg_backend(StreamHandle h, int enabled) {
+    if (!h) return;
+    const_cast<cppdvr::StreamServerConfig&>(
+        static_cast<cppdvr::StreamServer*>(h)->config()).auto_jpeg_backend =
+            (enabled != 0);
+}
+
 CPPDVR_API void stream_stop(StreamHandle h) {
     if (h) static_cast<cppdvr::StreamServer*>(h)->stop();
 }

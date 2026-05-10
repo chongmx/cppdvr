@@ -140,6 +140,49 @@ struct LatestJpeg {
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
+// Single-slot JPEG queue: reader thread → overlay worker thread
+//
+// The reader always overwrites the slot with the newest raw JPEG from ffmpeg.
+// If the overlay worker is slower than the frame rate, old frames are silently
+// dropped — the display shows the newest available frame rather than falling
+// behind.  This keeps the ffmpeg stdout pipe draining at full speed regardless
+// of overlay processing time, preventing pipe stalls and ffmpeg death.
+// ════════════════════════════════════════════════════════════════════════════════
+struct JpegSlot {
+    std::mutex              mtx;
+    std::condition_variable cv;
+    std::vector<uint8_t>    frame;
+    bool                    has_frame{false};
+    bool                    done     {false};
+
+    void put(std::vector<uint8_t> f) {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            frame     = std::move(f);
+            has_frame = true;
+        }
+        cv.notify_one();
+    }
+
+    void close() {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            done = true;
+        }
+        cv.notify_all();
+    }
+
+    bool get(std::vector<uint8_t>& out, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait_for(lk, timeout, [this]{ return has_frame || done; });
+        if (!has_frame) return false;
+        out       = std::move(frame);
+        has_frame = false;
+        return true;
+    }
+};
+
+// ════════════════════════════════════════════════════════════════════════════════
 // ffmpeg process wrapper (cross-platform via platform_process)
 // ════════════════════════════════════════════════════════════════════════════════
 struct FfmpegProc {
@@ -149,15 +192,21 @@ struct FfmpegProc {
     PlatformPipe    stderr_pipe {INVALID_PIPE};
 
     bool start(const std::string& codec, int jpeg_quality,
-               int jpeg_scale_w = 0, int jpeg_scale_h = 0) {
+               int jpeg_scale_w = 0, int jpeg_scale_h = 0,
+               const std::string& hwaccel = "") {
         std::string fmt = "h264";
         if (codec == "h265")  fmt = "hevc";
         else if (codec == "mpeg4") fmt = "mpeg4";
 
-        std::vector<std::string> args = {
-            "-loglevel", "warning",
-            "-f", fmt, "-i", "pipe:0"
-        };
+        std::vector<std::string> args = { "-loglevel", "warning" };
+
+        // Hardware-accelerated decode — must come before -f / -i
+        if (!hwaccel.empty()) {
+            args.push_back("-hwaccel");
+            args.push_back(hwaccel);
+        }
+
+        args.insert(args.end(), { "-f", fmt, "-i", "pipe:0" });
 
         // Optional scale filter
         if (jpeg_scale_w > 0 || jpeg_scale_h > 0) {
@@ -598,15 +647,18 @@ struct StreamServer::Impl {
 
             // Start ffmpeg
             if (cfg.jpeg_scale_w > 0 || cfg.jpeg_scale_h > 0)
-                log("ffmpeg: launching  codec=%s  q=%d  scale=%dx%d",
+                log("ffmpeg: launching  codec=%s  q=%d  scale=%dx%d  hwaccel=%s",
                     codec.c_str(), cfg.jpeg_quality,
-                    cfg.jpeg_scale_w, cfg.jpeg_scale_h);
+                    cfg.jpeg_scale_w, cfg.jpeg_scale_h,
+                    cfg.ffmpeg_hwaccel.empty() ? "off" : cfg.ffmpeg_hwaccel.c_str());
             else
-                log("ffmpeg: launching  codec=%s  q=%d  scale=native",
-                    codec.c_str(), cfg.jpeg_quality);
+                log("ffmpeg: launching  codec=%s  q=%d  scale=native  hwaccel=%s",
+                    codec.c_str(), cfg.jpeg_quality,
+                    cfg.ffmpeg_hwaccel.empty() ? "off" : cfg.ffmpeg_hwaccel.c_str());
             FfmpegProc ffmpeg;
             if (!ffmpeg.start(codec, cfg.jpeg_quality,
-                              cfg.jpeg_scale_w, cfg.jpeg_scale_h)) {
+                              cfg.jpeg_scale_w, cfg.jpeg_scale_h,
+                              cfg.ffmpeg_hwaccel)) {
                 log("ffmpeg: FAILED to start — is 'ffmpeg' in PATH? Retrying in 5 s");
                 std::this_thread::sleep_for(std::chrono::seconds(5));
                 continue;
@@ -616,24 +668,28 @@ struct StreamServer::Impl {
             // Feed first frame
             ffmpeg.write(first_iframe.data.data(), first_iframe.data.size());
 
-            // Reader thread: extract JPEG frames from ffmpeg stdout (blocking read)
+            // Single-slot between reader and overlay worker.
+            // Reader is always fast (just IO); overlay worker may drop frames
+            // under load rather than stalling the ffmpeg stdout pipe.
+            JpegSlot jpeg_slot;
             std::atomic<bool> pipe_ok{true};
+
+            // ── Reader thread: drain ffmpeg stdout → jpeg_slot ───────────────
             std::thread reader([&]() {
                 std::vector<uint8_t> buf;
                 buf.reserve(512 * 1024);
-
                 uint8_t chunk[8192];
+
                 while (true) {
                     int n = ffmpeg.read(chunk, sizeof(chunk));
-                    if (n <= 0) { pipe_ok.store(false); break; }  // EOF or error
+                    if (n <= 0) { pipe_ok.store(false); break; }
                     buf.insert(buf.end(), chunk, chunk + n);
 
-                    // Extract complete JPEG frames (\xFF\xD8 ... \xFF\xD9)
+                    // Extract all complete JPEG frames from buf
                     while (true) {
                         auto* d = buf.data();
                         size_t sz = buf.size();
 
-                        // Find SOI
                         size_t soi = std::string::npos;
                         for (size_t i = 0; i + 1 < sz; ++i) {
                             if (d[i] == 0xFF && d[i+1] == 0xD8) { soi = i; break; }
@@ -643,125 +699,122 @@ struct StreamServer::Impl {
                             break;
                         }
 
-                        // Find EOI after SOI
                         size_t eoi = std::string::npos;
                         for (size_t i = soi + 2; i + 1 < sz; ++i) {
                             if (d[i] == 0xFF && d[i+1] == 0xD9) { eoi = i + 2; break; }
                         }
                         if (eoi == std::string::npos) break;
 
-                        // Complete JPEG
-                        std::vector<uint8_t> jpeg(d + soi, d + eoi);
-                        bool first_frame = latest_jpeg.get().empty();
-
-                        // ── Apply overlay (decode → draw → re-encode) ────────
-                        {
-                            // Snapshot all overlay state before touching pixels
-                            StreamServer::OverlayFrameFn frame_fn;
-                            {
-                                std::lock_guard<std::mutex> lk(overlay_mutex);
-                                frame_fn = overlay_frame_cb;
-                            }
-                            auto tsnap = text_snap();
-
-                            BoxState::Snap bsnaps[STREAM_OVERLAY_MAX_BOXES];
-                            bool has_boxes = false;
-                            for (int bi = 0; bi < STREAM_OVERLAY_MAX_BOXES; ++bi) {
-                                bsnaps[bi] = overlay_boxes[bi].snap();
-                                if (bsnaps[bi].active && !bsnaps[bi].empty)
-                                    has_boxes = true;
-                            }
-
-                            bool has_text  = tsnap.text[0] != '\0';
-                            bool needs_rgb = (frame_fn != nullptr)
-                                             || has_text || has_boxes;
-
-                            if (needs_rgb) {
-                                int w = 0, h = 0;
-                                uint8_t* rgb = jpeg_decode_rgb(
-                                    jpeg.data(), jpeg.size(), &w, &h);
-                                if (rgb) {
-                                    uint64_t ts = ++overlay_frame_count * 40000u;
-
-                                    // Custom frame callback
-                                    if (frame_fn) frame_fn(rgb, ts, w, h);
-
-                                    // Single-region legacy overlay
-                                    if (has_text) {
-                                        int sc = tsnap.scale > 0
-                                                 ? tsnap.scale
-                                                 : (h > 400 ? h / 400 : 1);
-                                        int ox = tsnap.cx >= 0 ? tsnap.cx : 8 * sc;
-                                        int oy;
-                                        if (tsnap.cy >= 0) {
-                                            oy = tsnap.cy;
-                                        } else {
-                                            int nln = 1;
-                                            for (const char* p = tsnap.text; *p; ++p)
-                                                if (*p == '\n') ++nln;
-                                            int bh = nln * 8 * sc;
-                                            oy = (h > bh) ? h - bh : 0;
-                                        }
-                                        jpeg_overlay_draw_text(
-                                            rgb, w, h, tsnap.text,
-                                            ox, oy, 255, 255, 255, sc);
-                                    }
-
-                                    // Text boxes
-                                    for (int bi = 0; bi < STREAM_OVERLAY_MAX_BOXES; ++bi) {
-                                        const auto& b = bsnaps[bi];
-                                        if (!b.active || b.empty) continue;
-                                        int sc = b.scale > 0
-                                                 ? b.scale
-                                                 : (h > 400 ? h / 400 : 1);
-                                        jpeg_overlay_draw_textbox(
-                                            rgb, w, h, b.text,
-                                            b.x, b.y, b.box_w,
-                                            255, 255, 255,
-                                            sc, b.align, b.anchor);
-                                    }
-
-                                    uint8_t* enc = nullptr;
-                                    size_t   esz = 0;
-                                    if (jpeg_encode_rgb(rgb, w, h, 90, &enc, &esz) && enc) {
-                                        jpeg.assign(enc, enc + esz);
-                                        free(enc);
-                                    }
-                                    free(rgb);
-                                }
-                            }
-                        }
-                        // ── End overlay ──────────────────────────────────────
-
-                        // Fire JPEG-ready callback before moving (move empties the vector)
-                        {
-                            std::lock_guard<std::mutex> lk(jpeg_cb_mutex);
-                            if (jpeg_cb) jpeg_cb(jpeg.data(), jpeg.size());
-                        }
-
-                        // Fire overlay JPEG callback (post-overlay; used by recorder
-                        // so the GUI can independently use jpeg_cb for display)
-                        {
-                            std::lock_guard<std::mutex> lk(overlay_jpeg_cb_mutex);
-                            if (overlay_jpeg_cb) overlay_jpeg_cb(jpeg.data(), jpeg.size());
-                        }
-
-                        latest_jpeg.update(std::move(jpeg));
-                        if (first_frame) log("ffmpeg: first JPEG frame ready — streaming");
-
+                        // Hand the raw JPEG to the overlay worker (overwrites if unread).
+                        jpeg_slot.put(std::vector<uint8_t>(d + soi, d + eoi));
                         buf.erase(buf.begin(), buf.begin() + eoi);
                     }
                 }
+                jpeg_slot.close();  // signal overlay worker to finish
             });
 
-            // Feed frames from camera queue → ffmpeg stdin
+            // ── Overlay worker thread: apply overlay, fire callbacks ──────────
+            std::thread overlay_worker([&]() {
+                std::vector<uint8_t> jpeg;
+                while (jpeg_slot.get(jpeg, std::chrono::milliseconds(200))) {
+                    bool first_frame = latest_jpeg.get().empty();
+
+                    // ── Apply overlay (decode → draw → re-encode) ────────────
+                    {
+                        StreamServer::OverlayFrameFn frame_fn;
+                        {
+                            std::lock_guard<std::mutex> lk(overlay_mutex);
+                            frame_fn = overlay_frame_cb;
+                        }
+                        auto tsnap = text_snap();
+
+                        BoxState::Snap bsnaps[STREAM_OVERLAY_MAX_BOXES];
+                        bool has_boxes = false;
+                        for (int bi = 0; bi < STREAM_OVERLAY_MAX_BOXES; ++bi) {
+                            bsnaps[bi] = overlay_boxes[bi].snap();
+                            if (bsnaps[bi].active && !bsnaps[bi].empty)
+                                has_boxes = true;
+                        }
+
+                        bool has_text  = tsnap.text[0] != '\0';
+                        bool needs_rgb = (frame_fn != nullptr) || has_text || has_boxes;
+
+                        if (needs_rgb) {
+                            int w = 0, h = 0;
+                            uint8_t* rgb = jpeg_decode_rgb(
+                                jpeg.data(), jpeg.size(), &w, &h);
+                            if (rgb) {
+                                uint64_t ts = ++overlay_frame_count * 40000u;
+
+                                if (frame_fn) frame_fn(rgb, ts, w, h);
+
+                                if (has_text) {
+                                    int sc = tsnap.scale > 0
+                                             ? tsnap.scale
+                                             : (h > 400 ? h / 400 : 1);
+                                    int ox = tsnap.cx >= 0 ? tsnap.cx : 8 * sc;
+                                    int oy;
+                                    if (tsnap.cy >= 0) {
+                                        oy = tsnap.cy;
+                                    } else {
+                                        int nln = 1;
+                                        for (const char* p = tsnap.text; *p; ++p)
+                                            if (*p == '\n') ++nln;
+                                        int bh = nln * 8 * sc;
+                                        oy = (h > bh) ? h - bh : 0;
+                                    }
+                                    jpeg_overlay_draw_text(
+                                        rgb, w, h, tsnap.text,
+                                        ox, oy, 255, 255, 255, sc);
+                                }
+
+                                for (int bi = 0; bi < STREAM_OVERLAY_MAX_BOXES; ++bi) {
+                                    const auto& b = bsnaps[bi];
+                                    if (!b.active || b.empty) continue;
+                                    int sc = b.scale > 0
+                                             ? b.scale
+                                             : (h > 400 ? h / 400 : 1);
+                                    jpeg_overlay_draw_textbox(
+                                        rgb, w, h, b.text,
+                                        b.x, b.y, b.box_w,
+                                        255, 255, 255,
+                                        sc, b.align, b.anchor);
+                                }
+
+                                uint8_t* enc = nullptr;
+                                size_t   esz = 0;
+                                if (jpeg_encode_rgb(rgb, w, h, 90, &enc, &esz) && enc) {
+                                    jpeg.assign(enc, enc + esz);
+                                    free(enc);
+                                }
+                                free(rgb);
+                            }
+                            // If decode failed the original JPEG from ffmpeg is kept.
+                        }
+                    }
+                    // ── End overlay ──────────────────────────────────────────
+
+                    {
+                        std::lock_guard<std::mutex> lk(jpeg_cb_mutex);
+                        if (jpeg_cb) jpeg_cb(jpeg.data(), jpeg.size());
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(overlay_jpeg_cb_mutex);
+                        if (overlay_jpeg_cb) overlay_jpeg_cb(jpeg.data(), jpeg.size());
+                    }
+
+                    latest_jpeg.update(std::move(jpeg));
+                    if (first_frame) log("ffmpeg: first JPEG frame ready — streaming");
+                }
+            });
+
+            // ── Feed frames from camera queue → ffmpeg stdin ─────────────────
             while (running.load() && pipe_ok.load()) {
                 RawFrame f;
                 if (!raw_queue.pop(f, std::chrono::milliseconds(10000))) {
                     if (!running.load()) break;
-                    continue;  // timed out, no frames
+                    continue;
                 }
-                // Only feed video frames (skip audio/info)
                 if (f.meta.type == "g711a" || f.meta.type == "info") continue;
 
                 if (!ffmpeg.write(f.data.data(), f.data.size())) {
@@ -773,6 +826,7 @@ struct StreamServer::Impl {
             pipe_ok.store(false);
             ffmpeg.terminate();
             reader.join();
+            overlay_worker.join();
 
             log("ffmpeg: pipeline stopped — restarting in 3 s");
             std::this_thread::sleep_for(std::chrono::seconds(3));
@@ -839,6 +893,15 @@ void StreamServer::set_stream_type(const std::string& stream_type) {
 
 bool StreamServer::start() {
     if (d_->running.load()) return false;
+
+    // Auto-select the fastest available JPEG backend if the user hasn't
+    // already switched away from the default (STB).
+    if (d_->cfg.auto_jpeg_backend &&
+        ::jpeg_backend_get() == JPEG_BACKEND_STB) {
+        if (::jpeg_backend_available(JPEG_BACKEND_LIBJPEG_TURBO))
+            ::jpeg_backend_set(JPEG_BACKEND_LIBJPEG_TURBO);
+    }
+
     d_->running.store(true);
 
     d_->camera_thread   = std::thread([this]{ d_->run_camera(); });
