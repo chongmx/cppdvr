@@ -51,7 +51,7 @@ struct StreamServerConfig {
     //   "d3d11va" — DirectX 11 Video Acceleration (Windows; Intel/AMD/NVIDIA)
     //   "vaapi"   — Video Acceleration API (Linux; Intel/AMD)
     //   ""        — software decode (disable hardware acceleration)
-    std::string ffmpeg_hwaccel = "auto";
+    std::string ffmpeg_hwaccel = "";
 
     // When true, StreamServer::start() automatically selects the fastest available
     // JPEG backend (libjpeg-turbo > stb_image) if the process-global backend is

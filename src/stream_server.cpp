@@ -172,13 +172,21 @@ struct JpegSlot {
         cv.notify_all();
     }
 
+    // Returns true with a frame, false only when the slot is permanently closed.
+    // Waits up to `timeout` per iteration; re-enters automatically on spurious
+    // wakeups or frame-rate gaps until done=true.
     bool get(std::vector<uint8_t>& out, std::chrono::milliseconds timeout) {
-        std::unique_lock<std::mutex> lk(mtx);
-        cv.wait_for(lk, timeout, [this]{ return has_frame || done; });
-        if (!has_frame) return false;
-        out       = std::move(frame);
-        has_frame = false;
-        return true;
+        while (true) {
+            std::unique_lock<std::mutex> lk(mtx);
+            cv.wait_for(lk, timeout, [this]{ return has_frame || done; });
+            if (has_frame) {
+                out       = std::move(frame);
+                has_frame = false;
+                return true;
+            }
+            if (done) return false;   // closed and empty — producer is gone
+            // timed out but not done — loop again
+        }
     }
 };
 
@@ -632,12 +640,8 @@ struct StreamServer::Impl {
                     if (!detected.empty())         codec = detected;
                     else if (!f.meta.type.empty()) codec = f.meta.type;
 
-                    log("ffmpeg: codec=%s  %dx%d @ %d fps  first-bytes: %02x%02x%02x%02x",
-                        codec.c_str(), f.meta.width, f.meta.height, f.meta.fps,
-                        f.data.size() > 0 ? f.data[0] : 0,
-                        f.data.size() > 1 ? f.data[1] : 0,
-                        f.data.size() > 2 ? f.data[2] : 0,
-                        f.data.size() > 3 ? f.data[3] : 0);
+                    log("ffmpeg: codec=%s  %dx%d @ %d fps",
+                        codec.c_str(), f.meta.width, f.meta.height, f.meta.fps);
 
                     first_iframe = std::move(f);
                     got_first = true;
@@ -673,6 +677,30 @@ struct StreamServer::Impl {
             // under load rather than stalling the ffmpeg stdout pipe.
             JpegSlot jpeg_slot;
             std::atomic<bool> pipe_ok{true};
+
+            // ── Stderr drainer: prevent ffmpeg from blocking on a full pipe ──
+            // Without this, ffmpeg stalls if its stderr output exceeds the OS
+            // pipe buffer (~4 KB), causing stdin writes to also stall.
+            std::thread stderr_drain([&]() {
+                char buf[512];
+                std::string line;
+                while (true) {
+                    int n = platform_read_pipe(ffmpeg.stderr_pipe,
+                                               buf, sizeof(buf) - 1);
+                    if (n <= 0) break;
+                    buf[n] = '\0';
+                    for (int i = 0; i < n; ++i) {
+                        if (buf[i] == '\n') {
+                            if (!line.empty())
+                                log("ffmpeg stderr: %s", line.c_str());
+                            line.clear();
+                        } else {
+                            line += buf[i];
+                        }
+                    }
+                }
+                if (!line.empty()) log("ffmpeg stderr: %s", line.c_str());
+            });
 
             // ── Reader thread: drain ffmpeg stdout → jpeg_slot ───────────────
             std::thread reader([&]() {
@@ -827,6 +855,7 @@ struct StreamServer::Impl {
             ffmpeg.terminate();
             reader.join();
             overlay_worker.join();
+            stderr_drain.join();
 
             log("ffmpeg: pipeline stopped — restarting in 3 s");
             std::this_thread::sleep_for(std::chrono::seconds(3));

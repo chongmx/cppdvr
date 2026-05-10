@@ -29,6 +29,12 @@ typedef atomic_int    atomic_int_t;
 #  define ATOMIC_LOAD(x) atomic_load(&(x))
 #endif
 
+static void log_to_stderr(const char* msg, void* userdata) {
+    (void)userdata;
+    fprintf(stderr, "[DVR] %s\n", msg);
+    fflush(stderr);
+}
+
 typedef struct {
     atomic_int_t  frame_count;
     /* First-frame capture (written once, then never updated) */
@@ -85,6 +91,7 @@ int main(int argc, char* argv[]) {
     StreamState state;
     memset(&state, 0, sizeof(state));
 
+    stream_set_log_callback(h, log_to_stderr, NULL);
     stream_set_jpeg_callback(h, on_jpeg, &state);
 
     if (!stream_start(h, stream)) {
