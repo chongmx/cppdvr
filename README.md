@@ -12,7 +12,8 @@ Exposes both a C++ class API and a pure-C export API callable from any language 
 |---|---|
 | **Connection** | Login with Sofia MD5 auth, session keep-alive, multi-NIC bind |
 | **Live streaming** | H264/H265/MPEG4 frame callbacks; HTTP MJPEG server via ffmpeg |
-| **Recording** | MP4 (stream-copy or re-encode) and MJPEG AVI via ffmpeg |
+| **Recording** | MP4 (stream-copy or re-encode) and MJPEG AVI via ffmpeg; dual-stream (raw + overlay) |
+| **Software overlay** | Push-based text; multi-box layout with word-wrap, alignment, and anchor; thread-safe double-buffer |
 | **Snapshot** | JPEG snapshot capture |
 | **PTZ** | All 8 directions, zoom, focus, iris, presets, tours |
 | **Time** | Get and set device clock |
@@ -229,6 +230,62 @@ rec.save_recording();
 rec.deinit();
 ```
 
+### C++ API — software text overlay
+
+The overlay is push-based and thread-safe. Text is written to a back-buffer under a mutex; the render pipeline swaps it into a front-buffer without blocking your writer thread.
+
+#### Single-region overlay (quick use)
+
+```cpp
+srv.overlay_set_scale(4);          // 32 px glyphs (8 px × scale 4)
+srv.overlay_set_cursor(-1, -1);    // auto: bottom-left with proportional margin
+srv.overlay_print("CGS Venture Inc.\n12.34 m");   // '\n' = new line
+srv.overlay_clear();               // remove text
+```
+
+#### Multi-box overlay (word-wrap, alignment, anchor)
+
+Up to `StreamServer::kOverlayMaxBoxes` (default 4, override with `-DSTREAM_OVERLAY_MAX_BOXES=N`) independent boxes can be configured:
+
+```cpp
+using Align  = cppdvr::StreamServer::OverlayAlign;
+using Anchor = cppdvr::StreamServer::OverlayAnchor;
+
+// Box 0 — company name, top-right, right-aligned
+srv.overlay_box_configure(0,
+    /*x_pad=*/16, /*y_pad=*/16,
+    /*box_w=*/700,
+    /*scale=*/4,
+    Align::Right,
+    Anchor::TopRight);
+srv.overlay_box_print(0, "CGS Venture Inc.");
+
+// Box 1 — live reading updated from any thread at any rate
+srv.overlay_box_configure(1, 16, 56, 700, 4, Align::Right, Anchor::TopRight);
+srv.overlay_box_print(1, "0.00 m");
+
+// Box 2 — address; long text word-wraps within box_w=700 px
+srv.overlay_box_configure(2, 16, 96, 700, 4, Align::Right, Anchor::TopRight);
+srv.overlay_box_print(2, "Bandar Puteri, Puchong, Selangor");
+
+// Later, from any thread (e.g. sensor callback):
+char buf[64];
+snprintf(buf, sizeof(buf), "%.2f m", distance);
+srv.overlay_box_print(1, buf);         // atomic double-buffer swap
+```
+
+#### Dual recording (raw + overlay streams simultaneously)
+
+```cpp
+// GUI display — uses the standard JPEG callback (no overlay burned in)
+srv.set_jpeg_callback([](const uint8_t* jpeg, size_t size) { /* display */ });
+
+// Overlay recording — uses a dedicated post-overlay JPEG callback
+srv.set_overlay_jpeg_callback([](const uint8_t* jpeg, size_t size) {
+    // feed to VideoRecorder or any other sink
+});
+```
+
 ### C API
 
 ```c
@@ -287,7 +344,7 @@ dvr_destroy(h);
 
 // ── Stream server + recorder ──────────────────────────────────────────────────
 StreamHandle srv = stream_create("192.168.1.100", 0, "admin", "", 8080);
-stream_set_jpeg_callback(srv, my_jpeg_cb, NULL);
+stream_set_jpeg_callback(srv, my_jpeg_cb, NULL);          // GUI display callback
 stream_start(srv, "Main");
 
 RecorderHandle rec = recorder_create();
@@ -300,6 +357,43 @@ recorder_destroy(rec);
 
 stream_stop(srv);
 stream_destroy(srv);
+
+// ── Software text overlay (push-based, thread-safe) ───────────────────────────
+// Single-region overlay
+stream_overlay_set_scale(srv, 4);           // 32 px glyphs
+stream_overlay_set_cursor(srv, -1, -1);     // auto: bottom-left with margin
+stream_overlay_print(srv, "CGS Venture Inc.\n12.34 m");
+stream_overlay_clear(srv);
+
+// Multi-box overlay: up to STREAM_OVERLAY_MAX_BOXES (default 4) boxes
+stream_overlay_box_configure(srv,
+    /*idx=*/0,
+    /*x=*/16, /*y=*/16,
+    /*box_w=*/700,
+    /*scale=*/4,
+    STREAM_OVERLAY_ALIGN_RIGHT,
+    STREAM_OVERLAY_ANCHOR_TOP_RIGHT);
+stream_overlay_box_print(srv, 0, "CGS Venture Inc.");
+
+stream_overlay_box_configure(srv, 1, 16, 56, 700, 4,
+    STREAM_OVERLAY_ALIGN_RIGHT, STREAM_OVERLAY_ANCHOR_TOP_RIGHT);
+stream_overlay_box_print(srv, 1, "0.00 m");         // updated each sensor tick
+
+stream_overlay_box_configure(srv, 2, 16, 96, 700, 4,
+    STREAM_OVERLAY_ALIGN_RIGHT, STREAM_OVERLAY_ANCHOR_TOP_RIGHT);
+stream_overlay_box_print(srv, 2, "Bandar Puteri, Puchong, Selangor");
+
+// Dedicated post-overlay JPEG callback for recording without conflicting with GUI
+stream_set_overlay_jpeg_callback(srv, my_overlay_jpeg_cb, NULL);
+
+// ── Dual recording (raw NAL + overlay JPEG simultaneously) ────────────────────
+RecorderHandle rec_raw     = recorder_create();
+RecorderHandle rec_overlay = recorder_create();
+recorder_init_with_stream(rec_raw, srv);         // hooks raw NAL frames
+recorder_init_standalone(rec_overlay);           // fed manually via callback
+stream_set_overlay_jpeg_callback(srv, overlay_jpeg_to_recorder_cb, rec_overlay);
+recorder_start(rec_raw,     "raw.mp4",     RECORDER_FORMAT_MP4,   25);
+recorder_start(rec_overlay, "overlay.mp4", RECORDER_FORMAT_MJPEG, 25);
 ```
 
 ---
@@ -376,6 +470,56 @@ Common config names: `"Camera"`, `"Simplify.Encode"`, `"AVEnc.VideoColor"`, `"Ne
 
 `DVRDiscoveredDeviceC` fields: `ip[64]`, `mac[32]`, `hostname[128]`, `sn[64]`, `tcp_port`, `http_port`
 
+### Stream server — overlay
+
+#### Constants
+
+| Constant | Value | Description |
+|---|---|---|
+| `STREAM_OVERLAY_MAX_TEXT` | 512 | Maximum bytes per overlay text region (incl. null terminator) |
+| `STREAM_OVERLAY_MAX_BOXES` | 4 | Maximum simultaneous text boxes (recompile with `-DSTREAM_OVERLAY_MAX_BOXES=N`) |
+| `STREAM_OVERLAY_ALIGN_LEFT` | 0 | Left-align text within box_w |
+| `STREAM_OVERLAY_ALIGN_RIGHT` | 1 | Right-align text within box_w |
+| `STREAM_OVERLAY_ANCHOR_TOP_LEFT` | 0 | x, y measured inward from top-left corner |
+| `STREAM_OVERLAY_ANCHOR_TOP_RIGHT` | 1 | x, y measured inward from top-right corner |
+| `STREAM_OVERLAY_ANCHOR_BOTTOM_LEFT` | 2 | x, y measured inward from bottom-left corner |
+| `STREAM_OVERLAY_ANCHOR_BOTTOM_RIGHT` | 3 | x, y measured inward from bottom-right corner |
+
+#### Single-region overlay
+
+| Function | Description |
+|---|---|
+| `stream_overlay_set_cursor(sh, x, y)` | Pixel origin for first character; `-1,-1` = auto bottom-left |
+| `stream_overlay_set_scale(sh, scale)` | Glyph scale factor (1 = native 8×8 px); `0` = auto (`frame_height/400`) |
+| `stream_overlay_print(sh, text)` | Replace overlay text; `'\n'` starts a new line |
+| `stream_overlay_clear(sh)` | Remove overlay (no text drawn until next `stream_overlay_print`) |
+
+#### Multi-box overlay
+
+| Function | Description |
+|---|---|
+| `stream_overlay_box_configure(sh, idx, x, y, box_w, scale, align, anchor)` | Configure box `idx` (0…MAX_BOXES-1); call before printing |
+| `stream_overlay_box_print(sh, idx, text)` | Set display text; `'\n'` forces line break; long lines word-wrap at `box_w` |
+| `stream_overlay_box_clear(sh, idx)` | Hide box `idx` |
+| `stream_overlay_box_clear_all(sh)` | Hide all boxes |
+
+Parameters for `stream_overlay_box_configure`:
+
+| Parameter | Description |
+|---|---|
+| `idx` | Box index (0 to `STREAM_OVERLAY_MAX_BOXES - 1`) |
+| `x`, `y` | Inward pixel offset from the anchor corner |
+| `box_w` | Text-box width in pixels; controls word-wrap and right-alignment |
+| `scale` | Glyph scale factor; `0` = auto |
+| `align` | `STREAM_OVERLAY_ALIGN_LEFT` or `STREAM_OVERLAY_ALIGN_RIGHT` |
+| `anchor` | One of the `STREAM_OVERLAY_ANCHOR_*` corner constants |
+
+#### Overlay JPEG callback
+
+| Function | Description |
+|---|---|
+| `stream_set_overlay_jpeg_callback(sh, cb, userdata)` | Fired with the post-overlay JPEG for every frame; use for recording the overlaid stream without conflicting with the GUI's `stream_set_jpeg_callback` |
+
 ### Utility
 
 | Function | Description |
@@ -391,15 +535,17 @@ cppdvr/
 ├── include/
 │   ├── dvrip.h                  C++ DVRIPCam class
 │   ├── cppdvr_api.h             Pure-C export API
-│   ├── stream_server.h          HTTP MJPEG streaming server
+│   ├── stream_server.h          HTTP MJPEG streaming server + overlay API
 │   ├── video_recorder.h         MP4 / MJPEG recording
 │   └── udp_stream_server.h      XRRO UDP link for Quest 3
 ├── src/
 │   ├── dvrip.cpp                DVRIP protocol implementation
 │   ├── cppdvr_api.cpp           C wrappers around C++ classes
-│   ├── stream_server.cpp        ffmpeg pipeline + HTTP server
+│   ├── stream_server.cpp        ffmpeg pipeline + HTTP server + overlay pipeline
 │   ├── video_recorder.cpp       MP4/MJPEG recording via ffmpeg
 │   ├── udp_stream_server.cpp    XRRO v1 UDP protocol
+│   ├── jpeg_overlay.h           Internal: 8×8 bitmap font, text/textbox rendering (internal only)
+│   ├── jpeg_overlay.cpp         JPEG decode → draw overlay → JPEG re-encode (stb_image)
 │   ├── dllmain.cpp              Windows DLL entry point
 │   └── platform/
 │       ├── platform_net.h       Socket abstraction interface
@@ -407,10 +553,18 @@ cppdvr/
 │       ├── platform_process.h   Process spawning abstraction
 │       ├── windows/             Winsock2, CryptoAPI, CreateProcess
 │       └── posix/               BSD sockets, OpenSSL/built-in MD5, fork/exec
+├── third_party/
+│   └── stb/
+│       ├── stb_image.h          Single-header JPEG/PNG decode (Sean Barrett)
+│       └── stb_image_write.h    Single-header JPEG/PNG encode
 ├── demo/
 │   ├── main.cpp                 DVR → ffmpeg → MJPEG + UDP Quest 3 stream
 │   ├── test_frame.cpp           Frame callback diagnostics
 │   └── test_rec_mp4.c           C-API recording test
+├── tests/
+│   └── osd/
+│       ├── test_dual_record.c   Dual-stream recording with 3-box HUD overlay
+│       └── test_overlay_record.c  Push-based single-region overlay recording test
 ├── docs/
 │   ├── feature-status.md        Protocol feature implementation status
 │   └── CROSS_COMPILATION_PLAN.md  Linux porting design and notes

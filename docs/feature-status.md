@@ -15,6 +15,7 @@ C++ implementation read from current source tree as of 2026-05-09.
 | Snapshot (JPEG) | **Complete** | `dvr_snapshot` | Yes | 1560 |
 | PTZ Control (all directions, zoom, focus, iris, preset, tour) | **Complete** | `dvr_ptz` | Yes | 1400 |
 | Recording (MP4 stream-copy / re-encode / MJPEG) | **Complete** | `recorder_*` | No | — |
+| Software JPEG overlay (text + textbox) | **Complete** | `stream_overlay_*` | No | — |
 | UDP/XRRO Controller Link | **Complete** | `udp_*` | No | — |
 | Generic get/set command interface | **Complete** | `dvr_get_info` / `dvr_set_info` | Yes | 1042/1040 |
 | Error handling / Logging callbacks | **Complete** | — | Yes | — |
@@ -61,6 +62,10 @@ C++ implementation read from current source tree as of 2026-05-09.
 | [src/platform/platform_process.h](../src/platform/platform_process.h) | Cross-platform process abstraction |
 | [src/platform/windows/](../src/platform/windows/) | Windows implementations (Winsock2, CryptoAPI) |
 | [src/platform/posix/](../src/platform/posix/) | POSIX implementations (BSD sockets, OpenSSL) |
+| [src/jpeg_overlay.h](../src/jpeg_overlay.h) | Internal: 8×8 bitmap font, draw_text/draw_textbox declarations |
+| [src/jpeg_overlay.cpp](../src/jpeg_overlay.cpp) | JPEG decode → draw overlay → re-encode using stb_image |
+| [third_party/stb/stb_image.h](../third_party/stb/stb_image.h) | Single-header JPEG/PNG decode |
+| [third_party/stb/stb_image_write.h](../third_party/stb/stb_image_write.h) | Single-header JPEG/PNG encode |
 
 ---
 
@@ -111,6 +116,37 @@ C++ implementation read from current source tree as of 2026-05-09.
 - NAL codec auto-detection: scans first 1 KB of I-frame for SPS/PPS/IDR NALs (H264 types 5-8, H265 types 16-23, 32-34)
 - Controls: `start_recording`, `feed_raw_frame`, `feed_jpeg`, `save_recording`, `discard_recording`, `pause_recording`, `resume_recording`
 - Frame buffer: 300 frames (`RECORDER_BUFFER_FRAMES`); oldest dropped on overflow
+
+### 6a. Software JPEG Overlay System
+
+- **Files:** [src/jpeg_overlay.h](../src/jpeg_overlay.h), [src/jpeg_overlay.cpp](../src/jpeg_overlay.cpp), [src/stream_server.cpp](../src/stream_server.cpp)
+- Decode/encode cycle triggered only when at least one overlay (text, box, or frame callback) is active — raw frames bypass the pipeline entirely at zero cost
+- Single JPEG decode → draw all overlays → single JPEG re-encode per frame
+- Dedicated post-overlay JPEG callback (`stream_set_overlay_jpeg_callback`) fires after re-encode; GUI uses `stream_set_jpeg_callback` independently — no conflict between display and recording
+
+**Embedded 8×8 bitmap font**
+- 95-character ASCII table (0x20–0x7E) stored as a `uint8_t[95][8]` array
+- Each byte is one row; bit 0 = leftmost pixel
+- Scale factor renders each font pixel as a `scale × scale` block (scale 4 → 32 px glyphs on 2880×1616 cameras)
+- Shadow: glyph drawn at `(x+scale, y+scale)` in black, then at `(x,y)` in white — visible on any background
+
+**Push-based single-region overlay** (`stream_overlay_set_cursor`, `stream_overlay_set_scale`, `stream_overlay_print`, `stream_overlay_clear`)
+- User calls `stream_overlay_print` from any thread at any rate
+- Text written to a `back` buffer under a mutex; render thread snapshots the `front` buffer (swapped from `back` when dirty) under the same lock
+- Lock held for ≤ 2 × `memcpy(512 B)` ≈ 100 ns — never blocks the render thread meaningfully
+- `STREAM_OVERLAY_MAX_TEXT = 512` bytes — excess silently truncated (buffer-overflow safe)
+- `'\n'` in text forces an explicit line break; auto-y positions text so the full block fits above the bottom edge
+
+**Multi-box overlay** (`stream_overlay_box_configure`, `stream_overlay_box_print`, `stream_overlay_box_clear`, `stream_overlay_box_clear_all`)
+- Up to `STREAM_OVERLAY_MAX_BOXES` (default 4) simultaneous independent boxes
+- Compile-time override: `-DSTREAM_OVERLAY_MAX_BOXES=N`
+- Each box has its own position, width, scale, alignment (`Left`/`Right`), and anchor corner (`TopLeft`, `TopRight`, `BottomLeft`, `BottomRight`)
+- Anchor system: `x,y` are inward pixel offsets from the named corner; resolved to actual pixel coordinates at render time using live frame dimensions — resolution-independent
+- Word-wrap engine (`build_lines()` in jpeg_overlay.cpp): splits on spaces, respects explicit `'\n'`, hard-breaks words longer than `box_w`; up to 64 lines of 256 chars each
+- Right-alignment per line: `lx = anchor_x + box_w − line_pixel_width`
+- Same double-buffer scheme per box: each `BoxState` has its own mutex, `back`/`front` buffers, and `dirty` flag
+
+**Tested 2026-05-09:** 15/15 pass (test_dual_record) — 5 s of dual recording; 3-box HUD (company name, live distance counter, address with word-wrap) rendered top-right at scale=4; raw MP4 (H.265 stream-copy) and overlay MP4 (H.264 re-encode) both verified ≥ 8 KB; first frames extracted and validated as JPEG (FF D8)
 
 ### 7. UDP / XRRO Controller Link
 - **Files:** [src/udp_stream_server.cpp](../src/udp_stream_server.cpp), [include/udp_stream_server.h](../include/udp_stream_server.h)
