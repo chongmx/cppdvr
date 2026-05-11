@@ -267,25 +267,187 @@ recorder_save(rec);
 
 ---
 
+## Hardware acceleration
+
+### Decode acceleration (H.264 / H.265 → MJPEG pipeline)
+
+The decode accelerator controls how ffmpeg decodes the raw camera bitstream.
+Call `stream_set_decode_accel()` **before** `stream_start()`.
+
+```c
+// Constants (from cppdvr_api.h)
+// CPPDVR_DECODE_ACCEL_SOFTWARE  0  — always software
+// CPPDVR_DECODE_ACCEL_CUDA      1  — NVIDIA NVDEC
+// CPPDVR_DECODE_ACCEL_OTHER_HW  2  — d3d11va (Windows) / vaapi (Linux)
+// CPPDVR_DECODE_ACCEL_AUTO      3  — auto-probe, best available (default)
+
+stream_set_decode_accel(sh, CPPDVR_DECODE_ACCEL_AUTO);     // default — no call needed
+stream_set_decode_accel(sh, CPPDVR_DECODE_ACCEL_CUDA);     // force NVIDIA NVDEC
+stream_set_decode_accel(sh, CPPDVR_DECODE_ACCEL_OTHER_HW); // force d3d11va / vaapi
+stream_set_decode_accel(sh, CPPDVR_DECODE_ACCEL_SOFTWARE); // force software
+
+// Query current setting:
+int accel = stream_get_decode_accel(sh);
+```
+
+**Auto mode behavior:**
+
+1. Probes `ffmpeg -hwaccels` once at first call (result cached for the process lifetime).
+2. On Windows: tries `d3d11va` first, then `cuda`.  On Linux: tries `vaapi` first, then `cuda`.
+3. If the selected hardware accelerator produces no decoded frames on the first
+   pipeline attempt, automatically falls back to software for all subsequent
+   retries — no application code needed.
+
+The library also normalises the decoded pixel format to `yuv420p` before
+the software MJPEG encoder regardless of which accelerator is chosen, so
+hardware and software paths produce identical JPEG output.
+
+**Raw override** — for edge cases where you need to pass a specific ffmpeg
+hwaccel string not covered by the enum:
+
+```c
+stream_set_hwaccel(sh, "dxva2");   // raw ffmpeg -hwaccel value
+stream_set_hwaccel(sh, "");        // clear override (use decode_accel enum again)
+```
+
+When the raw override is non-empty it takes precedence over `decode_accel`.
+
+---
+
+### Encode acceleration (recorder re-encode / MJPEG → MP4)
+
+The encode accelerator controls which video encoder ffmpeg uses when the
+recorder needs to re-encode video.
+
+**When it applies:**
+- MJPEG recording saved as `.mp4` — JPEG frames are re-encoded to H.264.
+- MP4 re-encode mode (`RECORDER_USE_COPY=0`) — raw NAL stream is re-encoded.
+
+**When it does NOT apply:**
+- MP4 stream-copy mode (`RECORDER_USE_COPY=1`, the default) — raw NAL bytes
+  are remuxed without re-encoding; no encoder is involved.
+- MJPEG AVI/MKV output — JPEG frames are written directly; no encoder is used.
+
+```c
+// Constants (from cppdvr_api.h)
+// CPPDVR_ENCODE_ACCEL_SOFTWARE  0  — libx264 / libx265
+// CPPDVR_ENCODE_ACCEL_CUDA      1  — h264_nvenc / hevc_nvenc  (NVIDIA)
+// CPPDVR_ENCODE_ACCEL_OTHER_HW  2  — h264_qsv / hevc_qsv  (Intel QuickSync)
+// CPPDVR_ENCODE_ACCEL_AUTO      3  — probe best available (default)
+
+recorder_set_encode_accel(rec, CPPDVR_ENCODE_ACCEL_AUTO);     // default — no call needed
+recorder_set_encode_accel(rec, CPPDVR_ENCODE_ACCEL_CUDA);     // force NVIDIA NVENC
+recorder_set_encode_accel(rec, CPPDVR_ENCODE_ACCEL_OTHER_HW); // force Intel QSV
+recorder_set_encode_accel(rec, CPPDVR_ENCODE_ACCEL_SOFTWARE); // force libx264/libx265
+
+// Query current setting:
+int accel = recorder_get_encode_accel(rec);
+```
+
+**Auto mode behavior:**
+
+1. Checks `ffmpeg -encoders` to see which encoders are compiled in.
+2. Runs a small smoke-test encode (128×128, ~0.3 s) for each candidate to
+   confirm the hardware actually works on this machine — catches the common
+   case where an encoder is compiled into ffmpeg but the GPU is absent or has
+   outdated drivers.
+3. Tries in order: **NVENC → QSV → AMF → libx264/libx265**.
+4. Result is cached for the process lifetime — the probe runs at most once
+   per encoder candidate.
+
+**Quality parameters used by each encoder:**
+
+| Encoder | Mode | Parameter |
+|---------|------|-----------|
+| libx264 / libx265 | CRF | `-crf 18 -preset veryfast` |
+| h264_nvenc / hevc_nvenc | Const QP | `-rc constqp -qp 18` |
+| h264_qsv / hevc_qsv | Global quality | `-global_quality 18` |
+| h264_amf / hevc_amf | Const QP | `-rc cqp -qp_i 18 -qp_p 18` |
+
+Lower QP/CRF = better quality and larger file.  These defaults target a
+visually near-lossless output for surveillance footage.
+
+---
+
+### Typical configuration for a UI settings panel
+
+```c
+// Map a combo-box selection (0–3) directly to the accel constant:
+void apply_settings(StreamHandle sh, RecorderHandle rec,
+                    int decode_combo, int encode_combo)
+{
+    // decode_combo: 0=Auto, 1=Software, 2=CUDA, 3=Platform HW
+    static const int decode_map[] = {
+        CPPDVR_DECODE_ACCEL_AUTO,
+        CPPDVR_DECODE_ACCEL_SOFTWARE,
+        CPPDVR_DECODE_ACCEL_CUDA,
+        CPPDVR_DECODE_ACCEL_OTHER_HW,
+    };
+    // encode_combo: 0=Auto, 1=Software, 2=CUDA, 3=Platform HW
+    static const int encode_map[] = {
+        CPPDVR_ENCODE_ACCEL_AUTO,
+        CPPDVR_ENCODE_ACCEL_SOFTWARE,
+        CPPDVR_ENCODE_ACCEL_CUDA,
+        CPPDVR_ENCODE_ACCEL_OTHER_HW,
+    };
+    stream_set_decode_accel(sh, decode_map[decode_combo]);
+    recorder_set_encode_accel(rec, encode_map[encode_combo]);
+}
+```
+
+Both calls must be made **before** `stream_start()` for decode, and before
+`recorder_start()` for encode.  The encoder setting is safe to change between
+recordings without stopping the stream.
+
+---
+
+### JPEG decode/encode backend (overlay pipeline)
+
+The overlay pipeline (JPEG decode → RGB draw → JPEG encode) has its own
+backend selector, independent of the ffmpeg accelerators above.
+
+```c
+// CPPDVR_JPEG_BACKEND_STB           0  — stb_image (default, zero deps)
+// CPPDVR_JPEG_BACKEND_LIBJPEG_TURBO 1  — SIMD (SSE2/AVX2/NEON) — fast on CPU
+// CPPDVR_JPEG_BACKEND_NVJPEG        2  — NVIDIA GPU JPEG — lowest latency
+
+// Query availability:
+if (cppdvr_jpeg_backend_available(CPPDVR_JPEG_BACKEND_LIBJPEG_TURBO))
+    cppdvr_set_jpeg_backend(CPPDVR_JPEG_BACKEND_LIBJPEG_TURBO);
+
+// Or let the library auto-select (default, happens inside stream_start()):
+stream_set_auto_jpeg_backend(sh, 1);  // 1 = on (default)
+```
+
+Auto-selection order: nvJPEG → libjpeg-turbo → stb_image.  When
+`auto_jpeg_backend` is true (the default), `stream_start()` promotes to
+the fastest available backend if the process is still at the stb default.
+
+---
+
 ## Full lifecycle
 
 ```
 stream_create()
     │
+    ├── stream_set_decode_accel()      ← HW decode: Auto/CUDA/OtherHW/Software
     ├── stream_overlay_set_scale()     ← configure before start
     ├── stream_overlay_print()
     ├── stream_set_jpeg_callback()     ← display (optional)
     ├── stream_set_overlay_jpeg_callback()  ← recording (optional)
     │
     ├── recorder_create()
+    ├── recorder_set_encode_accel()    ← HW encode: Auto/CUDA/OtherHW/Software
     ├── recorder_init_with_stream()
     ├── recorder_start()
     │
 stream_start()          ← starts camera + ffmpeg + HTTP threads
+    │                      (probes hwaccels / JPEG backend here)
     │
     │   [running — callbacks fire from background threads]
-    │   stream_overlay_print()  ← can be called at any time
+    │   stream_overlay_print()          ← safe from any thread
     │   recorder_pause() / recorder_resume()
+    │   recorder_set_encode_accel()     ← safe to change between recordings
     │
 stream_stop()           ← blocks until all threads exit
 recorder_save()         ← flush and finalise output file
@@ -296,10 +458,10 @@ stream_destroy()
 ```
 
 Rules:
-- Configure callbacks and overlay **before** `stream_start()`.
+- Configure `decode_accel` and callbacks **before** `stream_start()`.
 - `stream_overlay_print()` is the only call safe to make **after** start from
   any thread.  All other configuration (`set_scale`, `set_cursor`,
-  `box_configure`) should be done before start.
+  `box_configure`, `set_decode_accel`) must be done before start.
 - `stream_stop()` is synchronous — when it returns all callbacks have
   finished and no more will fire.
 - Always call `recorder_save()` after `stream_stop()`, never before.
@@ -333,21 +495,31 @@ least 15 seconds before concluding the camera is unreachable.
 all threads.  Re-register callbacks after restart if they were set on
 per-run state.
 
-**Hardware decode breaks the image** — The default hwaccel is `""` (software
-decode).  Do not pass `"auto"` unless you have verified your ffmpeg build can
-decode H.265 into a pixel format compatible with the MJPEG encoder.  To opt
-in: `stream_set_hwaccel(sh, "d3d11va")` before `stream_start()`.
+**Hardware decode selected but image is blank or corrupted** — This should not
+happen with the default `CPPDVR_DECODE_ACCEL_AUTO` setting, which automatically
+falls back to software if the hardware path produces no frames.  If you forced
+a specific accelerator (`CUDA` or `OTHER_HW`) on a machine that doesn't support
+it, switch to `AUTO` or `SOFTWARE`.  The library adds pixel-format normalisation
+filters (`hwdownload`, `format=yuv420p`) automatically, so a correctly supported
+hardware decoder should always produce valid JPEG output.
 
-**Overlay text not showing up** — Text overlay requires a JPEG decode/encode
-cycle.  It only appears when either text or an `overlay_frame_callback` is
-set.  If you only set `stream_set_jpeg_callback()` (no overlay callback and no
-text), the pre-overlay JPEG fires with no decode cycle and overlay_worker is a
-no-op.  Use `stream_set_overlay_jpeg_callback()` for the recording path so
-the overlay cycle is triggered.
+**Hardware encoder probe is slow on first recording** — In `AUTO` mode the
+encoder probe runs once on the first `recorder_start()` call (a short
+smoke-test encode per candidate, ~0.3 s each).  The result is cached — all
+subsequent recordings use the cached encoder instantly.  To avoid the delay
+on first recording, call `recorder_set_encode_accel(rec, CPPDVR_ENCODE_ACCEL_SOFTWARE)`
+if you know you are on a machine without a GPU.
 
 **Recording produces no frames** — Verify you called
 `stream_set_overlay_jpeg_callback()` (not `stream_set_jpeg_callback()`) and
 that `recorder_start()` was called **before** `stream_start()`.
+
+**Overlay text not showing up** — Text overlay requires a JPEG decode/encode
+cycle.  It only appears when either text or an `overlay_frame_callback` is
+set.  If you only set `stream_set_jpeg_callback()` (no overlay callback and no
+text), the pre-overlay JPEG fires with no decode cycle.  Use
+`stream_set_overlay_jpeg_callback()` for the recording path to trigger the
+overlay cycle.
 
 ---
 
@@ -361,6 +533,7 @@ that `recorder_start()` was called **before** `stream_start()`.
 | `stream_get_frame()` | Safe from any thread |
 | `recorder_feed_jpeg()` | Safe from any thread (called from callback) |
 | `recorder_pause()` / `recorder_resume()` | Safe from any thread |
+| `recorder_set_encode_accel()` | Safe between recordings (not while recording) |
 | All other API calls | Call from one thread; not safe to race |
 
 Callbacks fire from **background threads** owned by the library.  Do not call
