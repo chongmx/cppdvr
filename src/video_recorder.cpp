@@ -23,12 +23,140 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace cppdvr {
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Encoder capability probe
+//
+// Checks presence (ffmpeg -encoders) AND runtime capability (tiny test encode).
+// Result is cached per encoder name — the smoke-test runs at most once per
+// encoder per process lifetime (< 0.5 s per encoder).
+// ════════════════════════════════════════════════════════════════════════════════
+static bool ffmpeg_encoder_in_list(const std::string& name) {
+    // Quick check: does ffmpeg list this encoder at all?
+    static std::mutex                  mu;
+    static std::map<std::string, bool> cache;
+    static bool                        probed = false;
+
+    std::lock_guard<std::mutex> lk(mu);
+    if (!probed) {
+        probed = true;
+#ifdef _WIN32
+        FILE* p = _popen("ffmpeg -encoders 2>nul", "r");
+#else
+        FILE* p = popen("ffmpeg -encoders 2>/dev/null", "r");
+#endif
+        if (p) {
+            char line[256];
+            while (fgets(line, sizeof(line), p)) {
+                if (line[0] != ' ' || line[1] == '-') continue;
+                const char* q = line + 1;
+                while (*q == ' ') ++q;           // skip leading spaces
+                while (*q && *q != ' ') ++q;     // skip flags column
+                while (*q == ' ') ++q;           // skip separator
+                char enc[64] = {};
+                int i = 0;
+                while (*q && *q != ' ' && i < 63) enc[i++] = *q++;
+                enc[i] = '\0';
+                if (i > 0) cache[enc] = true;
+            }
+#ifdef _WIN32
+            _pclose(p);
+#else
+            pclose(p);
+#endif
+        }
+    }
+    auto it = cache.find(name);
+    return it != cache.end() && it->second;
+}
+
+static bool ffmpeg_has_encoder(const std::string& name) {
+    // Two-stage check: listed AND actually works on this hardware.
+    // The smoke-test encodes one 128×128 frame — takes < 300 ms per call.
+    static std::mutex                  mu;
+    static std::map<std::string, bool> cap_cache;
+
+    if (!ffmpeg_encoder_in_list(name)) return false;
+
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = cap_cache.find(name);
+    if (it != cap_cache.end()) return it->second;
+
+#ifdef _WIN32
+    std::string cmd = "ffmpeg -loglevel error -f lavfi -i testsrc=s=128x128:r=1 -t 0.04 -c:v "
+                      + name + " -f null NUL 2>nul";
+#else
+    std::string cmd = "ffmpeg -loglevel error -f lavfi -i testsrc=s=128x128:r=1 -t 0.04 -c:v "
+                      + name + " -f null /dev/null 2>/dev/null";
+#endif
+    bool ok = (system(cmd.c_str()) == 0);
+    cap_cache[name] = ok;
+    return ok;
+}
+
+// Select the best available encoder for the given codec and accel preference.
+// Returns the ffmpeg encoder name and quality args to append.
+struct EncResolve {
+    std::string encoder;   // e.g. "h264_nvenc"
+    std::vector<std::string> quality_args;  // quality/preset flags for this encoder
+};
+
+static EncResolve resolve_encoder(const std::string& codec, EncodeAccel accel,
+                                   int crf, const std::string& sw_preset) {
+    bool is_h265 = (codec == "h265");
+
+    // Software encoders (always available if ffmpeg is in PATH)
+    auto sw = [&]() -> EncResolve {
+        std::string enc = is_h265 ? "libx265" : "libx264";
+        return { enc, { "-crf", std::to_string(crf), "-preset", sw_preset } };
+    };
+
+    switch (accel) {
+        case EncodeAccel::Software:
+            return sw();
+
+        case EncodeAccel::CUDA: {
+            std::string enc = is_h265 ? "hevc_nvenc" : "h264_nvenc";
+            if (ffmpeg_has_encoder(enc))
+                return { enc, { "-rc", "constqp", "-qp", std::to_string(crf) } };
+            return sw();
+        }
+
+        case EncodeAccel::OtherHW: {
+            std::string enc = is_h265 ? "hevc_qsv" : "h264_qsv";
+            if (ffmpeg_has_encoder(enc))
+                return { enc, { "-global_quality", std::to_string(crf) } };
+            return sw();
+        }
+
+        case EncodeAccel::Auto: {
+            // Try in order: NVENC → QSV → AMF → software
+            struct { const char* enc265; const char* enc264; std::vector<std::string> qa; } candidates[] = {
+                { "hevc_nvenc",  "h264_nvenc",
+                  { "-rc", "constqp", "-qp", std::to_string(crf) } },
+                { "hevc_qsv",   "h264_qsv",
+                  { "-global_quality", std::to_string(crf) } },
+                { "hevc_amf",   "h264_amf",
+                  { "-quality", "balanced", "-rc", "cqp",
+                    "-qp_i", std::to_string(crf), "-qp_p", std::to_string(crf) } },
+            };
+            for (auto& c : candidates) {
+                const char* enc = is_h265 ? c.enc265 : c.enc264;
+                if (ffmpeg_has_encoder(enc))
+                    return { enc, c.qa };
+            }
+            return sw();
+        }
+    }
+    return sw();
+}
 
 // ════════════════════════════════════════════════════════════════════════════════
 // NAL codec + I-frame detection
@@ -96,6 +224,7 @@ struct FfmpegRecProc {
 
     bool start(RecordingFormat fmt, const std::string& codec,
                const std::string& filename, int framerate,
+               EncodeAccel enc_accel = EncodeAccel::Auto,
                LogFn log_fn = nullptr) {
 
         std::vector<std::string> args = { "-loglevel", "warning" };
@@ -106,20 +235,23 @@ struct FfmpegRecProc {
 
 #if RECORDER_USE_COPY
             args.insert(args.end(), { "-c:v", "copy" });
+            if (log_fn) log_fn("recorder: encode=stream-copy (lossless)");
 #else
-            const std::string enc = (codec == "h265") ? "libx265" : "libx264";
-            args.insert(args.end(), {
-                "-c:v",    enc,
-                "-crf",    std::to_string(RECORDER_CRF),
-                "-preset", RECORDER_PRESET
-            });
+            EncResolve er = resolve_encoder(codec, enc_accel, RECORDER_CRF, RECORDER_PRESET);
+            args.push_back("-c:v");
+            args.push_back(er.encoder);
+            for (auto& a : er.quality_args) args.push_back(a);
+            if (log_fn) {
+                std::string msg = "recorder: encode=" + er.encoder;
+                log_fn(msg.c_str());
+            }
 #endif
             args.insert(args.end(), { "-y", filename });
 
         } else {
             // JPEG-frame input mode.
             // Output encoding is chosen from the filename extension:
-            //   .mp4  → libx264 H.264 (broad compat, smaller files)
+            //   .mp4  → H.264 encoder (GPU or software, selected by enc_accel)
             //   other → MJPEG in AVI  (lossless JPEG passthrough)
             const bool to_mp4 = filename.size() > 4 &&
                                   filename.substr(filename.size() - 4) == ".mp4";
@@ -129,14 +261,21 @@ struct FfmpegRecProc {
                 "-i", "pipe:0"
             });
             if (to_mp4) {
-                args.insert(args.end(), {
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                    "-crf", "18", "-preset", "veryfast"
-                });
+                // Always encode to H.264 for MP4 output; use enc_accel for selection
+                EncResolve er = resolve_encoder("h264", enc_accel, 18, "veryfast");
+                args.push_back("-c:v");
+                args.push_back(er.encoder);
+                args.insert(args.end(), { "-pix_fmt", "yuv420p" });
+                for (auto& a : er.quality_args) args.push_back(a);
+                if (log_fn) {
+                    std::string msg = "recorder: encode=" + er.encoder + " (mjpeg→mp4)";
+                    log_fn(msg.c_str());
+                }
             } else {
                 args.insert(args.end(), {
                     "-c:v", "mjpeg", "-pix_fmt", "yuvj420p", "-q:v", "3"
                 });
+                if (log_fn) log_fn("recorder: encode=mjpeg (passthrough quality)");
             }
             args.insert(args.end(), { "-y", filename });
         }
@@ -246,10 +385,11 @@ struct VideoRecorder::Impl {
     mutable std::mutex      mtx;
     std::condition_variable cv;
 
-    RecorderState           rec_state {RecorderState::Idle};
-    RecordingFormat         rec_fmt   {RecordingFormat::MP4};
+    RecorderState           rec_state  {RecorderState::Idle};
+    RecordingFormat         rec_fmt    {RecordingFormat::MP4};
+    EncodeAccel             enc_accel  {EncodeAccel::Auto};
     std::string             out_fname;
-    int                     rec_fps   {25};
+    int                     rec_fps    {25};
 
     // Stop / abort signals (set under mtx, checked by writer thread)
     bool q_stop  {false};   // save path: drain queue then finalise
@@ -333,11 +473,13 @@ struct VideoRecorder::Impl {
         bool        aborted     = false;
         std::string fname;
         RecordingFormat fmt;
+        EncodeAccel     ea;
         int fps;
         {
             std::lock_guard<std::mutex> lk(mtx);
             fname = out_fname;
             fmt   = rec_fmt;
+            ea    = enc_accel;
             fps   = rec_fps;
         }
 
@@ -377,7 +519,7 @@ struct VideoRecorder::Impl {
                     codec.c_str(), RECORDER_CRF, RECORDER_USE_COPY);
                 log("recorder: -> %s", fname.c_str());
 
-                if (!ffp.start(RecordingFormat::MP4, codec, fname, fps, [this](const char* m){ log(m); })) {
+                if (!ffp.start(RecordingFormat::MP4, codec, fname, fps, ea, [this](const char* m){ log(m); })) {
                     log("recorder: ffmpeg failed to start (is ffmpeg in PATH?)");
                     aborted = true; break;
                 }
@@ -389,7 +531,7 @@ struct VideoRecorder::Impl {
                 log("recorder: starting ffmpeg  format=mjpeg  fps=%d", fps);
                 log("recorder: -> %s", fname.c_str());
 
-                if (!ffp.start(RecordingFormat::MJPEG, "", fname, fps, [this](const char* m){ log(m); })) {
+                if (!ffp.start(RecordingFormat::MJPEG, "", fname, fps, ea, [this](const char* m){ log(m); })) {
                     log("recorder: ffmpeg failed to start (is ffmpeg in PATH?)");
                     aborted = true; break;
                 }
@@ -589,6 +731,16 @@ size_t VideoRecorder::frames_dropped()  const { return d_->count_dropped.load();
 void VideoRecorder::set_log_callback(LogFn fn) {
     std::lock_guard<std::mutex> lk(d_->log_mtx);
     d_->log_fn = std::move(fn);
+}
+
+void VideoRecorder::set_encode_accel(EncodeAccel accel) {
+    std::lock_guard<std::mutex> lk(d_->mtx);
+    d_->enc_accel = accel;
+}
+
+EncodeAccel VideoRecorder::get_encode_accel() const {
+    std::lock_guard<std::mutex> lk(d_->mtx);
+    return d_->enc_accel;
 }
 
 } // namespace cppdvr

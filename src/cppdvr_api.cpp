@@ -357,16 +357,33 @@ CPPDVR_API int stream_start(StreamHandle h, const char* stream_type) {
     return srv->start() ? 1 : 0;
 }
 
+CPPDVR_API void stream_set_decode_accel(StreamHandle h, int accel) {
+    if (!h) return;
+    auto& cfg = const_cast<cppdvr::StreamServerConfig&>(
+        static_cast<cppdvr::StreamServer*>(h)->config());
+    switch (accel) {
+        case CPPDVR_DECODE_ACCEL_SOFTWARE: cfg.decode_accel = cppdvr::DecodeAccel::Software; break;
+        case CPPDVR_DECODE_ACCEL_CUDA:     cfg.decode_accel = cppdvr::DecodeAccel::CUDA;     break;
+        case CPPDVR_DECODE_ACCEL_OTHER_HW: cfg.decode_accel = cppdvr::DecodeAccel::OtherHW;  break;
+        default:                           cfg.decode_accel = cppdvr::DecodeAccel::Auto;      break;
+    }
+}
+
+CPPDVR_API int stream_get_decode_accel(StreamHandle h) {
+    if (!h) return CPPDVR_DECODE_ACCEL_AUTO;
+    switch (static_cast<cppdvr::StreamServer*>(h)->config().decode_accel) {
+        case cppdvr::DecodeAccel::Software: return CPPDVR_DECODE_ACCEL_SOFTWARE;
+        case cppdvr::DecodeAccel::CUDA:     return CPPDVR_DECODE_ACCEL_CUDA;
+        case cppdvr::DecodeAccel::OtherHW:  return CPPDVR_DECODE_ACCEL_OTHER_HW;
+        default:                            return CPPDVR_DECODE_ACCEL_AUTO;
+    }
+}
+
 CPPDVR_API void stream_set_hwaccel(StreamHandle h, const char* hwaccel) {
     if (!h) return;
-    auto* srv = static_cast<cppdvr::StreamServer*>(h);
-    // Access config via the const getter and cast — config is ours to modify
-    // before start().  Use a non-const path: recreate via the stored config.
-    // StreamServerConfig is not publicly mutable after construction, so we
-    // expose it via a dedicated setter below on StreamServer.
-    // For now, cast away const (cfg is a value member, not truly const).
-    const_cast<cppdvr::StreamServerConfig&>(srv->config()).ffmpeg_hwaccel =
-        hwaccel ? hwaccel : "";
+    const_cast<cppdvr::StreamServerConfig&>(
+        static_cast<cppdvr::StreamServer*>(h)->config()).ffmpeg_hwaccel =
+            hwaccel ? hwaccel : "";
 }
 
 CPPDVR_API void stream_get_hwaccel(StreamHandle h, char* out_buf, int buf_len) {
@@ -707,6 +724,28 @@ CPPDVR_API int recorder_state(RecorderHandle h) {
 }
 CPPDVR_API size_t recorder_frames_recorded(RecorderHandle h) { return h ? rec_cast(h)->frames_recorded() : 0; }
 CPPDVR_API size_t recorder_frames_dropped(RecorderHandle h)  { return h ? rec_cast(h)->frames_dropped()  : 0; }
+
+CPPDVR_API void recorder_set_encode_accel(RecorderHandle h, int accel) {
+    if (!h) return;
+    cppdvr::EncodeAccel ea;
+    switch (accel) {
+        case CPPDVR_ENCODE_ACCEL_SOFTWARE: ea = cppdvr::EncodeAccel::Software; break;
+        case CPPDVR_ENCODE_ACCEL_CUDA:     ea = cppdvr::EncodeAccel::CUDA;     break;
+        case CPPDVR_ENCODE_ACCEL_OTHER_HW: ea = cppdvr::EncodeAccel::OtherHW;  break;
+        default:                           ea = cppdvr::EncodeAccel::Auto;      break;
+    }
+    rec_cast(h)->set_encode_accel(ea);
+}
+
+CPPDVR_API int recorder_get_encode_accel(RecorderHandle h) {
+    if (!h) return CPPDVR_ENCODE_ACCEL_AUTO;
+    switch (rec_cast(h)->get_encode_accel()) {
+        case cppdvr::EncodeAccel::Software: return CPPDVR_ENCODE_ACCEL_SOFTWARE;
+        case cppdvr::EncodeAccel::CUDA:     return CPPDVR_ENCODE_ACCEL_CUDA;
+        case cppdvr::EncodeAccel::OtherHW:  return CPPDVR_ENCODE_ACCEL_OTHER_HW;
+        default:                            return CPPDVR_ENCODE_ACCEL_AUTO;
+    }
+}
 
 CPPDVR_API void recorder_set_log_callback(RecorderHandle h,
                                            StreamLogCallback cb, void* userdata) {

@@ -209,15 +209,24 @@ CPPDVR_API void stream_destroy(StreamHandle h);
 // Returns non-zero on success.
 CPPDVR_API int stream_start(StreamHandle h, const char* stream_type);
 
-// ── Hardware acceleration ──────────────────────────────────────────────────────
-// Set the ffmpeg -hwaccel mode used for H.264/H.265 decoding.
-// Must be called before stream_start().  Pass "" to disable hardware decode.
-// Common values: "auto" (default), "cuda", "d3d11va" (Windows), "vaapi" (Linux).
-// "auto" lets ffmpeg pick the best available accelerator on the current host.
-CPPDVR_API void stream_set_hwaccel(StreamHandle h, const char* hwaccel);
+// ── Hardware acceleration — decode ────────────────────────────────────────────
+// Decode accelerator for the H.264/H.265 → MJPEG streaming pipeline.
+// The library probes available hwaccels once (ffmpeg -hwaccels) and caches results.
+#define CPPDVR_DECODE_ACCEL_SOFTWARE 0   // always software
+#define CPPDVR_DECODE_ACCEL_CUDA     1   // NVIDIA NVDEC
+#define CPPDVR_DECODE_ACCEL_OTHER_HW 2   // d3d11va (Windows) / vaapi (Linux)
+#define CPPDVR_DECODE_ACCEL_AUTO     3   // OtherHW → CUDA → software  (default)
 
-// Get the currently configured hwaccel string.
-// Writes into out_buf (null-terminated, at most buf_len bytes).
+// Set the decode accelerator.  Must be called before stream_start().
+CPPDVR_API void stream_set_decode_accel(StreamHandle h, int accel);
+
+// Get the currently configured decode accelerator (one of CPPDVR_DECODE_ACCEL_*).
+CPPDVR_API int  stream_get_decode_accel(StreamHandle h);
+
+// Raw hwaccel string override — passed verbatim as ffmpeg -hwaccel <value>.
+// When non-empty, takes precedence over stream_set_decode_accel().
+// Must be called before stream_start().  Pass "" to clear the override.
+CPPDVR_API void stream_set_hwaccel(StreamHandle h, const char* hwaccel);
 CPPDVR_API void stream_get_hwaccel(StreamHandle h, char* out_buf, int buf_len);
 
 // Control whether stream_start() auto-selects the fastest available JPEG backend.
@@ -600,6 +609,19 @@ CPPDVR_API size_t recorder_frames_recorded(RecorderHandle h);
 
 // Return the number of frames dropped (buffer overflow or paused) since last start.
 CPPDVR_API size_t recorder_frames_dropped(RecorderHandle h);
+
+// ── Encode acceleration ───────────────────────────────────────────────────────
+// Controls which encoder is used when the recorder re-encodes video.
+// Has no effect when RECORDER_USE_COPY=1 (stream-copy, the default for MP4).
+// The library probes available encoders once (ffmpeg -encoders) and caches results.
+#define CPPDVR_ENCODE_ACCEL_SOFTWARE 0   // libx264 / libx265
+#define CPPDVR_ENCODE_ACCEL_CUDA     1   // h264_nvenc / hevc_nvenc  (NVIDIA)
+#define CPPDVR_ENCODE_ACCEL_OTHER_HW 2   // h264_qsv / hevc_qsv  (Intel QuickSync)
+#define CPPDVR_ENCODE_ACCEL_AUTO     3   // NVENC → QSV → AMF → software  (default)
+
+// Set/get the encode accelerator.  Safe to change between recordings.
+CPPDVR_API void recorder_set_encode_accel(RecorderHandle h, int accel);
+CPPDVR_API int  recorder_get_encode_accel(RecorderHandle h);
 
 // Optional log/status callback — called from the writer thread.
 CPPDVR_API void recorder_set_log_callback(RecorderHandle h,

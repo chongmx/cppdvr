@@ -80,6 +80,17 @@ enum class RecorderState {
     Paused,     // session open; incoming frames are silently dropped
 };
 
+// Hardware accelerator selection for the video encode step.
+// Used when the recorder re-encodes video (MJPEG→MP4 or MP4 re-encode mode).
+// Stream-copy (RECORDER_USE_COPY=1) skips encode entirely; this has no effect.
+// The library probes available encoders once at first use and caches results.
+enum class EncodeAccel {
+    Software = 0,  // libx264 / libx265
+    CUDA     = 1,  // h264_nvenc / hevc_nvenc  (NVIDIA)
+    OtherHW  = 2,  // h264_qsv / hevc_qsv  (Intel QuickSync)
+    Auto     = 3,  // CUDA → QSV → AMF → software  (default)
+};
+
 class CPPDVR_API VideoRecorder {
 public:
     VideoRecorder();
@@ -162,6 +173,14 @@ public:
     std::string     current_filename() const;
     size_t          frames_recorded()  const;   // frames successfully written to ffmpeg
     size_t          frames_dropped()   const;   // dropped (buffer overflow or paused)
+
+    // ── Encode acceleration ───────────────────────────────────────────────────
+    // Controls which encoder is used when the recorder re-encodes video.
+    // Has no effect in stream-copy mode (RECORDER_USE_COPY=1, the default).
+    // Must be set before start_recording(); safe to change between recordings.
+    // Default: EncodeAccel::Auto (probes CUDA→QSV→AMF, falls back to software).
+    void         set_encode_accel(EncodeAccel accel);
+    EncodeAccel  get_encode_accel() const;
 
     // ── Log callback ──────────────────────────────────────────────────────────
     // Called from the writer thread — keep it brief and thread-safe.

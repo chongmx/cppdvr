@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -119,16 +120,23 @@ struct LatestJpeg {
     mutable std::mutex              mtx;
     std::condition_variable         cv;
     std::vector<uint8_t>            data;
+    size_t                          count{0};  // total frames ever written
 
     void update(std::vector<uint8_t> jpeg) {
         std::lock_guard<std::mutex> lk(mtx);
         data = std::move(jpeg);
+        ++count;
         cv.notify_all();
     }
 
     std::vector<uint8_t> get() const {
         std::lock_guard<std::mutex> lk(mtx);
         return data;
+    }
+
+    size_t frame_count() const {
+        std::lock_guard<std::mutex> lk(mtx);
+        return count;
     }
 
     // Wait up to 'ms' for a new frame; returns copy (empty if timed out).
@@ -191,6 +199,101 @@ struct JpegSlot {
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
+// Hardware-accel probe — runs `ffmpeg -hwaccels` once, caches results
+// ════════════════════════════════════════════════════════════════════════════════
+static bool ffmpeg_has_hwaccel(const std::string& name) {
+    static std::mutex                        mu;
+    static std::map<std::string, bool>       cache;
+    static bool                              probed = false;
+
+    std::lock_guard<std::mutex> lk(mu);
+    if (!probed) {
+        probed = true;
+#ifdef _WIN32
+        FILE* p = _popen("ffmpeg -hwaccels 2>nul", "r");
+#else
+        FILE* p = popen("ffmpeg -hwaccels 2>/dev/null", "r");
+#endif
+        if (p) {
+            char line[128];
+            while (fgets(line, sizeof(line), p)) {
+                // Trim trailing whitespace
+                int n = static_cast<int>(strlen(line));
+                while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r' ||
+                                  line[n-1] == ' '  || line[n-1] == '\t'))
+                    line[--n] = '\0';
+                if (n > 0 && line[0] != '\0' &&
+                    std::string(line) != "Hardware acceleration methods:")
+                    cache[line] = true;
+            }
+#ifdef _WIN32
+            _pclose(p);
+#else
+            pclose(p);
+#endif
+        }
+    }
+    auto it = cache.find(name);
+    return it != cache.end() && it->second;
+}
+
+// Resolve DecodeAccel enum to the hwaccel string that will actually be used.
+// Returns ("", "", "") for software.
+// Returns (accel_name, output_fmt_flag, vf_download_filter) for hardware.
+struct HwResolve {
+    std::string accel;      // -hwaccel value, e.g. "d3d11va"
+    std::string out_fmt;    // -hwaccel_output_format value, e.g. "nv12" or ""
+    std::string dl_filter;  // vf prefix for pixel-format download, e.g. "hwdownload,format=nv12"
+};
+
+static HwResolve make_hw_resolve(const std::string& accel) {
+    if (accel == "cuda")
+        return { "cuda", "cuda", "hwdownload,format=nv12" };
+#ifdef _WIN32
+    if (accel == "d3d11va")
+        return { "d3d11va", "nv12", "format=nv12" };
+    if (accel == "dxva2")
+        return { "dxva2",   "nv12", "format=nv12" };
+#endif
+    if (accel == "vaapi")
+        return { "vaapi", "vaapi", "hwdownload,format=nv12" };
+    // Generic fallback — try without output format, use scale to force download
+    return { accel, "", "scale=iw:ih" };
+}
+
+static HwResolve resolve_decode_accel(DecodeAccel accel, const std::string& raw_override) {
+    // Raw string override takes precedence
+    if (!raw_override.empty())
+        return make_hw_resolve(raw_override);
+
+    switch (accel) {
+        case DecodeAccel::Software:
+            return { "", "", "" };
+        case DecodeAccel::CUDA:
+            return make_hw_resolve("cuda");
+        case DecodeAccel::OtherHW:
+#ifdef _WIN32
+            return make_hw_resolve("d3d11va");
+#else
+            return make_hw_resolve("vaapi");
+#endif
+        case DecodeAccel::Auto: {
+            // Probe and pick the first supported option
+#ifdef _WIN32
+            static const char* candidates[] = { "d3d11va", "cuda", nullptr };
+#else
+            static const char* candidates[] = { "vaapi", "cuda", nullptr };
+#endif
+            for (int i = 0; candidates[i]; ++i)
+                if (ffmpeg_has_hwaccel(candidates[i]))
+                    return make_hw_resolve(candidates[i]);
+            return { "", "", "" };  // software fallback
+        }
+    }
+    return { "", "", "" };
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // ffmpeg process wrapper (cross-platform via platform_process)
 // ════════════════════════════════════════════════════════════════════════════════
 struct FfmpegProc {
@@ -200,28 +303,49 @@ struct FfmpegProc {
     PlatformPipe    stderr_pipe {INVALID_PIPE};
 
     bool start(const std::string& codec, int jpeg_quality,
-               int jpeg_scale_w = 0, int jpeg_scale_h = 0,
-               const std::string& hwaccel = "") {
+               int jpeg_scale_w, int jpeg_scale_h,
+               const HwResolve& hw) {
         std::string fmt = "h264";
         if (codec == "h265")  fmt = "hevc";
         else if (codec == "mpeg4") fmt = "mpeg4";
 
         std::vector<std::string> args = { "-loglevel", "warning" };
 
-        // Hardware-accelerated decode — must come before -f / -i
-        if (!hwaccel.empty()) {
+        // Hardware decode flags — must come before -f / -i
+        if (!hw.accel.empty()) {
             args.push_back("-hwaccel");
-            args.push_back(hwaccel);
+            args.push_back(hw.accel);
+            if (!hw.out_fmt.empty()) {
+                args.push_back("-hwaccel_output_format");
+                args.push_back(hw.out_fmt);
+            }
         }
 
         args.insert(args.end(), { "-f", fmt, "-i", "pipe:0" });
 
-        // Optional scale filter
+        // Build vf filter chain:
+        //   hw.dl_filter  — download GPU→CPU + initial format (e.g. "hwdownload,format=nv12")
+        //   scale         — optional output scale
+        //   format=yuv420p — normalize for the software MJPEG encoder
+        std::string vf;
+        if (!hw.dl_filter.empty()) vf = hw.dl_filter;
+
         if (jpeg_scale_w > 0 || jpeg_scale_h > 0) {
-            int w = jpeg_scale_w > 0 ? jpeg_scale_w : -1;
-            int h = jpeg_scale_h > 0 ? jpeg_scale_h : -1;
+            int w = jpeg_scale_w > 0 ? jpeg_scale_w : -2;
+            int h = jpeg_scale_h > 0 ? jpeg_scale_h : -2;
+            if (!vf.empty()) vf += ',';
+            vf += "scale=" + std::to_string(w) + ":" + std::to_string(h);
+        }
+
+        if (!hw.accel.empty()) {
+            // Always normalize to yuv420p for the software MJPEG encoder
+            if (!vf.empty()) vf += ',';
+            vf += "format=yuv420p";
+        }
+
+        if (!vf.empty()) {
             args.push_back("-vf");
-            args.push_back("scale=" + std::to_string(w) + ":" + std::to_string(h));
+            args.push_back(vf);
         }
 
         args.push_back("-f");
@@ -620,7 +744,16 @@ struct StreamServer::Impl {
 
     // ── Pipeline thread: feed ffmpeg, collect MJPEG ───────────────────────────
     void run_pipeline() {
+        // Resolve hwaccel once; for Auto mode we may fall back to SW after the
+        // first failed attempt (no frames produced despite pipe staying open).
+        HwResolve hw_resolved = resolve_decode_accel(cfg.decode_accel, cfg.ffmpeg_hwaccel);
+        bool hw_fallback_active = false;   // true after first Auto-mode HW failure
+
         while (running.load()) {
+            // For Auto mode: if HW failed on a previous iteration, use software.
+            HwResolve hw = hw_resolved;
+            if (hw_fallback_active) hw = { "", "", "" };
+
             // Wait for first I-frame to detect codec
             std::string codec = "h264";
             RawFrame first_iframe;
@@ -650,24 +783,26 @@ struct StreamServer::Impl {
             if (!running.load()) break;
 
             // Start ffmpeg
-            if (cfg.jpeg_scale_w > 0 || cfg.jpeg_scale_h > 0)
-                log("ffmpeg: launching  codec=%s  q=%d  scale=%dx%d  hwaccel=%s",
-                    codec.c_str(), cfg.jpeg_quality,
-                    cfg.jpeg_scale_w, cfg.jpeg_scale_h,
-                    cfg.ffmpeg_hwaccel.empty() ? "off" : cfg.ffmpeg_hwaccel.c_str());
-            else
-                log("ffmpeg: launching  codec=%s  q=%d  scale=native  hwaccel=%s",
-                    codec.c_str(), cfg.jpeg_quality,
-                    cfg.ffmpeg_hwaccel.empty() ? "off" : cfg.ffmpeg_hwaccel.c_str());
+            {
+                const char* hw_label = hw.accel.empty() ? "software" : hw.accel.c_str();
+                if (cfg.jpeg_scale_w > 0 || cfg.jpeg_scale_h > 0)
+                    log("ffmpeg: launching  codec=%s  q=%d  scale=%dx%d  decode=%s",
+                        codec.c_str(), cfg.jpeg_quality,
+                        cfg.jpeg_scale_w, cfg.jpeg_scale_h, hw_label);
+                else
+                    log("ffmpeg: launching  codec=%s  q=%d  scale=native  decode=%s",
+                        codec.c_str(), cfg.jpeg_quality, hw_label);
+            }
             FfmpegProc ffmpeg;
             if (!ffmpeg.start(codec, cfg.jpeg_quality,
-                              cfg.jpeg_scale_w, cfg.jpeg_scale_h,
-                              cfg.ffmpeg_hwaccel)) {
+                              cfg.jpeg_scale_w, cfg.jpeg_scale_h, hw)) {
                 log("ffmpeg: FAILED to start — is 'ffmpeg' in PATH? Retrying in 5 s");
                 std::this_thread::sleep_for(std::chrono::seconds(5));
                 continue;
             }
             log("ffmpeg: running — decoding to MJPEG");
+
+            size_t frames_at_start = latest_jpeg.frame_count();
 
             // Feed first frame
             ffmpeg.write(first_iframe.data.data(), first_iframe.data.size());
@@ -856,6 +991,19 @@ struct StreamServer::Impl {
             reader.join();
             overlay_worker.join();
             stderr_drain.join();
+
+            // Auto-mode HW fallback: if we tried a hardware accel and produced
+            // zero new frames, the GPU decoder likely doesn't support this codec
+            // or ffmpeg exited with an error.  Switch to software for all retries.
+            if (!hw_fallback_active && !hw.accel.empty() &&
+                cfg.decode_accel == DecodeAccel::Auto &&
+                cfg.ffmpeg_hwaccel.empty()) {
+                if (latest_jpeg.frame_count() == frames_at_start) {
+                    log("ffmpeg: HW decode (%s) produced no frames — falling back to software",
+                        hw.accel.c_str());
+                    hw_fallback_active = true;
+                }
+            }
 
             log("ffmpeg: pipeline stopped — restarting in 3 s");
             std::this_thread::sleep_for(std::chrono::seconds(3));

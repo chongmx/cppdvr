@@ -23,6 +23,15 @@
 
 namespace cppdvr {
 
+// Hardware accelerator selection for H.264/H.265 decode (streaming pipeline).
+// The library probes available hwaccels once at first use and caches results.
+enum class DecodeAccel {
+    Software = 0,  // always software decode
+    CUDA     = 1,  // NVIDIA NVDEC  (-hwaccel cuda)
+    OtherHW  = 2,  // platform HW: d3d11va (Windows) / vaapi (Linux)
+    Auto     = 3,  // try OtherHW → CUDA → software  (default)
+};
+
 struct StreamServerConfig {
     // DVR camera
     std::string dvr_host     = "172.20.80.12";
@@ -43,15 +52,12 @@ struct StreamServerConfig {
     int         jpeg_scale_w = 0;
     int         jpeg_scale_h = 0;
 
-    // Hardware-accelerated H.264/H.265 decode inside ffmpeg.
-    // Passed verbatim as: ffmpeg -hwaccel <value> ...
-    // Common values:
-    //   "auto"    — ffmpeg picks the best available (d3d11va on Windows, vaapi on Linux)
-    //   "cuda"    — NVIDIA NVDEC (requires CUDA-capable GPU and ffmpeg built with NVDEC)
-    //   "d3d11va" — DirectX 11 Video Acceleration (Windows; Intel/AMD/NVIDIA)
-    //   "vaapi"   — Video Acceleration API (Linux; Intel/AMD)
-    //   ""        — software decode (disable hardware acceleration)
-    std::string ffmpeg_hwaccel = "";
+    // H.264/H.265 decode acceleration.  Auto probes available hwaccels (d3d11va
+    // on Windows, vaapi on Linux) and falls back to software if none work.
+    // ffmpeg_hwaccel is a raw override: when non-empty it takes precedence over
+    // decode_accel and is passed verbatim as -hwaccel <value>.
+    DecodeAccel decode_accel    = DecodeAccel::Auto;
+    std::string ffmpeg_hwaccel  = "";   // raw override; prefer decode_accel
 
     // When true, StreamServer::start() automatically selects the fastest available
     // JPEG backend (libjpeg-turbo > stb_image) if the process-global backend is
