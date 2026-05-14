@@ -11,6 +11,7 @@
 #include "udp_stream_server.h"
 #include "video_recorder.h"
 #include "jpeg_overlay.h"   // jpeg_backend_*, jpeg_decode_rgb, jpeg_encode_rgb
+#include "accel_probe.h"    // ffmpeg_has_hwaccel, ffmpeg_has_encoder
 
 #include <cstdlib>
 #include <cstring>
@@ -752,6 +753,90 @@ CPPDVR_API void recorder_set_log_callback(RecorderHandle h,
     if (!h) return;
     if (cb) rec_cast(h)->set_log_callback([cb, userdata](const char* m){ cb(m, userdata); });
     else    rec_cast(h)->set_log_callback(nullptr);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Hardware availability queries
+// ════════════════════════════════════════════════════════════════════════════════
+
+CPPDVR_API int cppdvr_decode_accel_available(int accel) {
+    switch (accel) {
+        case CPPDVR_DECODE_ACCEL_SOFTWARE: return 1;
+        case CPPDVR_DECODE_ACCEL_AUTO:     return 1;
+        case CPPDVR_DECODE_ACCEL_CUDA:
+            return cppdvr::ffmpeg_has_hwaccel("cuda") ? 1 : 0;
+        case CPPDVR_DECODE_ACCEL_OTHER_HW:
+#ifdef _WIN32
+            return cppdvr::ffmpeg_has_hwaccel("d3d11va") ? 1 : 0;
+#else
+            return cppdvr::ffmpeg_has_hwaccel("vaapi") ? 1 : 0;
+#endif
+        default: return 0;
+    }
+}
+
+CPPDVR_API int cppdvr_encode_accel_available(int accel) {
+    switch (accel) {
+        case CPPDVR_ENCODE_ACCEL_SOFTWARE: return 1;
+        case CPPDVR_ENCODE_ACCEL_AUTO:     return 1;
+        case CPPDVR_ENCODE_ACCEL_CUDA:
+            return (cppdvr::ffmpeg_has_encoder("h264_nvenc") ||
+                    cppdvr::ffmpeg_has_encoder("hevc_nvenc")) ? 1 : 0;
+        case CPPDVR_ENCODE_ACCEL_OTHER_HW:
+            return (cppdvr::ffmpeg_has_encoder("h264_qsv") ||
+                    cppdvr::ffmpeg_has_encoder("hevc_qsv") ||
+                    cppdvr::ffmpeg_has_encoder("h264_amf") ||
+                    cppdvr::ffmpeg_has_encoder("hevc_amf")) ? 1 : 0;
+        default: return 0;
+    }
+}
+
+CPPDVR_API int cppdvr_decode_accel_name(int accel, char* out_buf, int buf_len) {
+    if (!out_buf || buf_len <= 0) return 0;
+    const char* name = nullptr;
+    switch (accel) {
+        case CPPDVR_DECODE_ACCEL_SOFTWARE: name = "software"; break;
+        case CPPDVR_DECODE_ACCEL_AUTO:     name = "auto";     break;
+        case CPPDVR_DECODE_ACCEL_CUDA:
+            if (cppdvr::ffmpeg_has_hwaccel("cuda")) name = "cuda";
+            break;
+        case CPPDVR_DECODE_ACCEL_OTHER_HW:
+#ifdef _WIN32
+            if (cppdvr::ffmpeg_has_hwaccel("d3d11va")) name = "d3d11va";
+#else
+            if (cppdvr::ffmpeg_has_hwaccel("vaapi"))   name = "vaapi";
+#endif
+            break;
+        default: break;
+    }
+    if (!name) { out_buf[0] = '\0'; return 0; }
+    std::strncpy(out_buf, name, static_cast<size_t>(buf_len) - 1);
+    out_buf[buf_len - 1] = '\0';
+    return 1;
+}
+
+CPPDVR_API int cppdvr_encode_accel_name(int accel, char* out_buf, int buf_len) {
+    if (!out_buf || buf_len <= 0) return 0;
+    const char* name = nullptr;
+    switch (accel) {
+        case CPPDVR_ENCODE_ACCEL_SOFTWARE: name = "libx264"; break;
+        case CPPDVR_ENCODE_ACCEL_AUTO:     name = "auto";    break;
+        case CPPDVR_ENCODE_ACCEL_CUDA:
+            if      (cppdvr::ffmpeg_has_encoder("h264_nvenc")) name = "h264_nvenc";
+            else if (cppdvr::ffmpeg_has_encoder("hevc_nvenc")) name = "hevc_nvenc";
+            break;
+        case CPPDVR_ENCODE_ACCEL_OTHER_HW:
+            if      (cppdvr::ffmpeg_has_encoder("h264_qsv")) name = "h264_qsv";
+            else if (cppdvr::ffmpeg_has_encoder("hevc_qsv")) name = "hevc_qsv";
+            else if (cppdvr::ffmpeg_has_encoder("h264_amf")) name = "h264_amf";
+            else if (cppdvr::ffmpeg_has_encoder("hevc_amf")) name = "hevc_amf";
+            break;
+        default: break;
+    }
+    if (!name) { out_buf[0] = '\0'; return 0; }
+    std::strncpy(out_buf, name, static_cast<size_t>(buf_len) - 1);
+    out_buf[buf_len - 1] = '\0';
+    return 1;
 }
 
 } // extern "C"

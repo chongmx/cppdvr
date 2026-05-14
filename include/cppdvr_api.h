@@ -623,6 +623,28 @@ CPPDVR_API size_t recorder_frames_dropped(RecorderHandle h);
 CPPDVR_API void recorder_set_encode_accel(RecorderHandle h, int accel);
 CPPDVR_API int  recorder_get_encode_accel(RecorderHandle h);
 
+// ── Hardware availability queries ─────────────────────────────────────────────
+// Use these to populate UI combo boxes — grey out options that return 0.
+// Results are cached after the first call (probe runs at most once per process).
+//
+// SOFTWARE and AUTO always return 1 (software fallback is always present).
+// CUDA/OTHER_HW return 0 when the hardware or driver is absent.
+
+// Returns 1 if the given CPPDVR_DECODE_ACCEL_* value is usable on this machine.
+CPPDVR_API int cppdvr_decode_accel_available(int accel);
+
+// Returns 1 if the given CPPDVR_ENCODE_ACCEL_* value is usable on this machine.
+// For CUDA this checks h264_nvenc/hevc_nvenc via a smoke-test encode (~300 ms,
+// cached).  For OTHER_HW it checks QSV then AMF.
+CPPDVR_API int cppdvr_encode_accel_available(int accel);
+
+// Fill out_buf with the backend name actually selected for this accel constant,
+// e.g. "d3d11va", "cuda", "h264_nvenc", "h264_qsv", "software", "auto".
+// Returns 1 on success, 0 if the accel is not available (buf set to "").
+// out_buf of 32 bytes is always sufficient.
+CPPDVR_API int cppdvr_decode_accel_name(int accel, char* out_buf, int buf_len);
+CPPDVR_API int cppdvr_encode_accel_name(int accel, char* out_buf, int buf_len);
+
 // Optional log/status callback — called from the writer thread.
 CPPDVR_API void recorder_set_log_callback(RecorderHandle h,
                                            StreamLogCallback cb,

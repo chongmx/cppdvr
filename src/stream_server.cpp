@@ -10,6 +10,7 @@
  */
 
 #include "stream_server.h"
+#include "accel_probe.h"
 #include "dvrip.h"
 #include "platform/platform_net.h"
 #include "platform/platform_process.h"
@@ -201,7 +202,7 @@ struct JpegSlot {
 // ════════════════════════════════════════════════════════════════════════════════
 // Hardware-accel probe — runs `ffmpeg -hwaccels` once, caches results
 // ════════════════════════════════════════════════════════════════════════════════
-static bool ffmpeg_has_hwaccel(const std::string& name) {
+bool ffmpeg_has_hwaccel(const std::string& name) {
     static std::mutex                        mu;
     static std::map<std::string, bool>       cache;
     static bool                              probed = false;

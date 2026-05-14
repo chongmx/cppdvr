@@ -12,6 +12,7 @@
  */
 
 #include "video_recorder.h"
+#include "accel_probe.h"
 #include "platform/platform_process.h"
 
 #include <filesystem>
@@ -77,7 +78,7 @@ static bool ffmpeg_encoder_in_list(const std::string& name) {
     return it != cache.end() && it->second;
 }
 
-static bool ffmpeg_has_encoder(const std::string& name) {
+bool ffmpeg_has_encoder(const std::string& name) {
     // Two-stage check: listed AND actually works on this hardware.
     // The smoke-test encodes one 128×128 frame — takes < 300 ms per call.
     static std::mutex                  mu;

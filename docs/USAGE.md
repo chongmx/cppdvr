@@ -401,6 +401,83 @@ recordings without stopping the stream.
 
 ---
 
+### Availability queries
+
+Use these to populate UI combo boxes at startup — grey out or hide options
+that return 0.  Results are cached after the first call; the encode probe
+includes a smoke-test (~0.3 s per hardware candidate, runs at most once).
+
+```c
+// Returns 1 if the accelerator can be used on this machine, 0 if not.
+// SOFTWARE and AUTO always return 1 (software fallback is always present).
+int cppdvr_decode_accel_available(int accel);
+int cppdvr_encode_accel_available(int accel);
+
+// Returns the backend name actually used, e.g. "d3d11va", "h264_nvenc".
+// Returns 0 and sets buf="" if the accel is not available.
+// 32 bytes is always sufficient for out_buf.
+int cppdvr_decode_accel_name(int accel, char* out_buf, int buf_len);
+int cppdvr_encode_accel_name(int accel, char* out_buf, int buf_len);
+```
+
+**Example — build combo-box items at application startup:**
+
+```c
+void populate_accel_combos(HWND decode_cb, HWND encode_cb)
+{
+    // Decode options
+    static const struct { int accel; const char* label; } dec[] = {
+        { CPPDVR_DECODE_ACCEL_AUTO,     "Auto (recommended)" },
+        { CPPDVR_DECODE_ACCEL_SOFTWARE, "Software"           },
+        { CPPDVR_DECODE_ACCEL_CUDA,     "CUDA (NVDEC)"       },
+        { CPPDVR_DECODE_ACCEL_OTHER_HW, "Platform HW"        },
+    };
+    char name[32];
+    for (int i = 0; i < 4; ++i) {
+        int avail = cppdvr_decode_accel_available(dec[i].accel);
+        char label[64];
+        if (avail && cppdvr_decode_accel_name(dec[i].accel, name, sizeof(name))
+                  && name[0] && strcmp(name, "auto") && strcmp(name, "software"))
+            snprintf(label, sizeof(label), "%s (%s)", dec[i].label, name);
+        else
+            snprintf(label, sizeof(label), "%s%s", dec[i].label, avail ? "" : " [unavailable]");
+        int idx = SendMessage(decode_cb, CB_ADDSTRING, 0, (LPARAM)label);
+        if (!avail) SendMessage(decode_cb, CB_SETITEMDATA, idx, (LPARAM)1); // flag disabled
+    }
+    SendMessage(decode_cb, CB_SETCURSEL, 0, 0);  // select Auto
+
+    // Encode options — same pattern
+    static const struct { int accel; const char* label; } enc[] = {
+        { CPPDVR_ENCODE_ACCEL_AUTO,     "Auto (recommended)"  },
+        { CPPDVR_ENCODE_ACCEL_SOFTWARE, "Software (libx264)"  },
+        { CPPDVR_ENCODE_ACCEL_CUDA,     "CUDA (NVENC)"        },
+        { CPPDVR_ENCODE_ACCEL_OTHER_HW, "Platform HW (QSV/AMF)" },
+    };
+    for (int i = 0; i < 4; ++i) {
+        int avail = cppdvr_encode_accel_available(enc[i].accel);
+        char label[64];
+        if (avail && cppdvr_encode_accel_name(enc[i].accel, name, sizeof(name))
+                  && name[0] && strcmp(name, "auto") && strcmp(name, "libx264"))
+            snprintf(label, sizeof(label), "%s (%s)", enc[i].label, name);
+        else
+            snprintf(label, sizeof(label), "%s%s", enc[i].label, avail ? "" : " [unavailable]");
+        SendMessage(encode_cb, CB_ADDSTRING, 0, (LPARAM)label);
+    }
+    SendMessage(encode_cb, CB_SETCURSEL, 0, 0);  // select Auto
+}
+```
+
+**What each availability check probes:**
+
+| Constant | Decode probe | Encode probe |
+|----------|-------------|--------------|
+| `SOFTWARE` | always available | always available |
+| `AUTO` | always available (falls back to SW) | always available (falls back to SW) |
+| `CUDA` | `ffmpeg -hwaccels` contains `cuda` | `h264_nvenc` / `hevc_nvenc` list + smoke-test |
+| `OTHER_HW` | `d3d11va` (Win) / `vaapi` (Linux) | `h264_qsv` → `h264_amf` (first that passes smoke-test) |
+
+---
+
 ### JPEG decode/encode backend (overlay pipeline)
 
 The overlay pipeline (JPEG decode → RGB draw → JPEG encode) has its own
